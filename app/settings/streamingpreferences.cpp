@@ -1,5 +1,6 @@
 #include "streamingpreferences.h"
 #include "utils.h"
+#include "streaming/audio/miccapture.h"
 
 #include <QSettings>
 #include <QTranslator>
@@ -37,21 +38,36 @@
 #define SER_CONNWARNINGS "connwarnings"
 #define SER_CONFWARNINGS "confwarnings"
 #define SER_UIDISPLAYMODE "uidisplaymode"
-#define SER_RICHPRESENCE "richpresence"
 #define SER_GAMEPADMOUSE "gamepadmouse"
 #define SER_DEFAULTVER "defaultver"
 #define SER_PACKETSIZE "packetsize"
-#define SER_DETECTNETBLOCKING "detectnetblocking"
 #define SER_SHOWPERFOVERLAY "showperfoverlay"
 #define SER_SWAPMOUSEBUTTONS "swapmousebuttons"
+#define SER_SWAPCMDCTRL "swapcmdctrl"
 #define SER_MUTEONFOCUSLOSS "muteonfocusloss"
 #define SER_BACKGROUNDGAMEPAD "backgroundgamepad"
 #define SER_REVERSESCROLL "reversescroll"
 #define SER_SWAPFACEBUTTONS "swapfacebuttons"
 #define SER_CAPTURESYSKEYS "capturesyskeys"
 #define SER_KEEPAWAKE "keepawake"
+// secure-desktop-stream: microphone passthrough
+#define SER_MICPASSTHROUGH "micpassthrough"
+#define SER_MICECHOCANCEL "micechocancel"
 #define SER_LANGUAGE "language"
 #define SER_RENDERER "renderer"
+
+// secure-desktop-stream: clipboard and file transfer
+#define SER_SDSCLIPBOARD "sdsclipboard"
+#define SER_SDSFILETRANSFER "sdsfiletransfer"
+#define SER_SDSFILECLIPBOARD "sdsfileclipboard"
+#define SER_SDSFILECLIPBOARDHOSTS "sdsfileclipboardhosts"
+#define SER_SDSAUTODOWNLOAD "sdsautodownload"
+// secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
+#define SER_SDSHOSTENCODER "sdshostencoder"
+#define SER_SDSHOSTADAPTERS "sdshostadapters"
+#define SER_SDSHOSTCAPTUREADAPTERS "sdshostcaptureadapters"
+#define SER_SDSMATCHHOSTRES "sdsmatchhostres"
+#define SER_SDSREVERTHOSTRES "sdsreverthostres"
 
 #define CURRENT_DEFAULT_VER 2
 
@@ -140,17 +156,19 @@ void StreamingPreferences::reload()
     framePacing = settings.value(SER_FRAMEPACING, false).toBool();
     connectionWarnings = settings.value(SER_CONNWARNINGS, true).toBool();
     configurationWarnings = settings.value(SER_CONFWARNINGS, true).toBool();
-    richPresence = settings.value(SER_RICHPRESENCE, true).toBool();
     gamepadMouse = settings.value(SER_GAMEPADMOUSE, true).toBool();
-    detectNetworkBlocking = settings.value(SER_DETECTNETBLOCKING, true).toBool();
     showPerformanceOverlay = settings.value(SER_SHOWPERFOVERLAY, false).toBool();
     packetSize = settings.value(SER_PACKETSIZE, 0).toInt();
     swapMouseButtons = settings.value(SER_SWAPMOUSEBUTTONS, false).toBool();
+    swapCmdCtrl = settings.value(SER_SWAPCMDCTRL, false).toBool();
     muteOnFocusLoss = settings.value(SER_MUTEONFOCUSLOSS, false).toBool();
     backgroundGamepad = settings.value(SER_BACKGROUNDGAMEPAD, false).toBool();
     reverseScrollDirection = settings.value(SER_REVERSESCROLL, false).toBool();
     swapFaceButtons = settings.value(SER_SWAPFACEBUTTONS, false).toBool();
     keepAwake = settings.value(SER_KEEPAWAKE, true).toBool();
+    // secure-desktop-stream: microphone passthrough
+    micPassthrough = settings.value(SER_MICPASSTHROUGH, false).toBool();
+    micEchoCancellation = settings.value(SER_MICECHOCANCEL, true).toBool();
     enableHdr = settings.value(SER_HDR, false).toBool();
     captureSysKeysMode = static_cast<CaptureSysKeysMode>(settings.value(SER_CAPTURESYSKEYS,
                                                          static_cast<int>(CaptureSysKeysMode::CSK_OFF)).toInt());
@@ -171,6 +189,24 @@ void StreamingPreferences::reload()
                                                                                                                  : UIDisplayMode::UI_MAXIMIZED)).toInt());
     language = static_cast<Language>(settings.value(SER_LANGUAGE,
                                                     static_cast<int>(Language::LANG_AUTO)).toInt());
+
+    // secure-desktop-stream: clipboard and file transfer
+    clipboardSync = settings.value(SER_SDSCLIPBOARD, true).toBool();
+    fileTransfer = settings.value(SER_SDSFILETRANSFER, true).toBool();
+    fileClipboard = settings.value(SER_SDSFILECLIPBOARD, false).toBool();
+    fileClipboardHosts = settings.value(SER_SDSFILECLIPBOARDHOSTS, QStringList()).toStringList();
+    autoDownloadOutbox = settings.value(SER_SDSAUTODOWNLOAD, true).toBool();
+
+    // secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
+    int rawHostEnc = settings.value(SER_SDSHOSTENCODER, static_cast<int>(HostEncoderConfig::HEC_AUTO)).toInt();
+    if (rawHostEnc < static_cast<int>(HostEncoderConfig::HEC_AUTO) || rawHostEnc > static_cast<int>(HostEncoderConfig::HEC_SOFTWARE)) {
+        rawHostEnc = static_cast<int>(HostEncoderConfig::HEC_AUTO);
+    }
+    hostEncoderConfig = static_cast<HostEncoderConfig>(rawHostEnc);
+    hostAdapterOverrides = settings.value(SER_SDSHOSTADAPTERS, QVariantMap()).toMap();
+    hostCaptureAdapterOverrides = settings.value(SER_SDSHOSTCAPTUREADAPTERS, QVariantMap()).toMap();
+    matchHostResolution = settings.value(SER_SDSMATCHHOSTRES, false).toBool();
+    revertHostResolution = settings.value(SER_SDSREVERTHOSTRES, false).toBool();
 
 
     // Perform default settings updates as required based on last default version
@@ -340,11 +376,12 @@ void StreamingPreferences::save()
     settings.setValue(SER_FRAMEPACING, framePacing);
     settings.setValue(SER_CONNWARNINGS, connectionWarnings);
     settings.setValue(SER_CONFWARNINGS, configurationWarnings);
-    settings.setValue(SER_RICHPRESENCE, richPresence);
     settings.setValue(SER_GAMEPADMOUSE, gamepadMouse);
     settings.setValue(SER_PACKETSIZE, packetSize);
-    settings.setValue(SER_DETECTNETBLOCKING, detectNetworkBlocking);
     settings.setValue(SER_SHOWPERFOVERLAY, showPerformanceOverlay);
+    // secure-desktop-stream: microphone passthrough
+    settings.setValue(SER_MICPASSTHROUGH, micPassthrough);
+    settings.setValue(SER_MICECHOCANCEL, micEchoCancellation);
     settings.setValue(SER_AUDIOCFG, static_cast<int>(audioConfig));
     settings.setValue(SER_HDR, enableHdr);
     settings.setValue(SER_YUV444, enableYUV444);
@@ -356,12 +393,93 @@ void StreamingPreferences::save()
     settings.setValue(SER_LANGUAGE, static_cast<int>(language));
     settings.setValue(SER_DEFAULTVER, CURRENT_DEFAULT_VER);
     settings.setValue(SER_SWAPMOUSEBUTTONS, swapMouseButtons);
+    settings.setValue(SER_SWAPCMDCTRL, swapCmdCtrl);
     settings.setValue(SER_MUTEONFOCUSLOSS, muteOnFocusLoss);
     settings.setValue(SER_BACKGROUNDGAMEPAD, backgroundGamepad);
     settings.setValue(SER_REVERSESCROLL, reverseScrollDirection);
     settings.setValue(SER_SWAPFACEBUTTONS, swapFaceButtons);
     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
     settings.setValue(SER_KEEPAWAKE, keepAwake);
+
+    // secure-desktop-stream: clipboard and file transfer
+    settings.setValue(SER_SDSCLIPBOARD, clipboardSync);
+    settings.setValue(SER_SDSFILETRANSFER, fileTransfer);
+    settings.setValue(SER_SDSFILECLIPBOARD, fileClipboard);
+    settings.setValue(SER_SDSFILECLIPBOARDHOSTS, fileClipboardHosts);
+    settings.setValue(SER_SDSAUTODOWNLOAD, autoDownloadOutbox);
+
+    // secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
+    settings.setValue(SER_SDSHOSTENCODER, static_cast<int>(hostEncoderConfig));
+    settings.setValue(SER_SDSHOSTADAPTERS, hostAdapterOverrides);
+    settings.setValue(SER_SDSHOSTCAPTUREADAPTERS, hostCaptureAdapterOverrides);
+    settings.setValue(SER_SDSMATCHHOSTRES, matchHostResolution);
+    settings.setValue(SER_SDSREVERTHOSTRES, revertHostResolution);
+}
+
+namespace {
+QString lookupPerHostOverride(const QVariantMap& map, const QString& fingerprint)
+{
+    if (fingerprint.isEmpty()) {
+        return QString();
+    }
+    return map.value(fingerprint).toString();
+}
+
+bool updatePerHostOverride(QVariantMap& map, const QString& fingerprint, const QString& adapterId)
+{
+    if (fingerprint.isEmpty()) {
+        return false;
+    }
+    QString trimmed = adapterId.trimmed();
+    if (trimmed.isEmpty()) {
+        if (!map.contains(fingerprint)) {
+            return false;
+        }
+        map.remove(fingerprint);
+        return true;
+    }
+    if (map.value(fingerprint).toString() == trimmed) {
+        return false;
+    }
+    map.insert(fingerprint, trimmed);
+    return true;
+}
+} // namespace
+
+QString StreamingPreferences::hostAdapterOverride(const QString& fingerprint) const
+{
+    return lookupPerHostOverride(hostAdapterOverrides, fingerprint);
+}
+
+void StreamingPreferences::setHostAdapterOverride(const QString& fingerprint, const QString& adapterId)
+{
+    if (updatePerHostOverride(hostAdapterOverrides, fingerprint, adapterId)) {
+        emit hostAdapterOverridesChanged();
+    }
+}
+
+QString StreamingPreferences::hostCaptureAdapterOverride(const QString& fingerprint) const
+{
+    return lookupPerHostOverride(hostCaptureAdapterOverrides, fingerprint);
+}
+
+void StreamingPreferences::setHostCaptureAdapterOverride(const QString& fingerprint, const QString& adapterId)
+{
+    if (updatePerHostOverride(hostCaptureAdapterOverrides, fingerprint, adapterId)) {
+        emit hostCaptureAdapterOverridesChanged();
+    }
+}
+
+void StreamingPreferences::requestMicrophonePermission()
+{
+    MicPermission::request([](bool granted) {
+        qInfo() << "Microphone access" << (granted ? "granted" : "not granted");
+    });
+}
+
+bool StreamingPreferences::isMicCaptureSupported() const
+{
+    return MicPermission::status() != MicPermission::Status::Unsupported;
 }
 
 int StreamingPreferences::getDefaultBitrate(int width, int height, int fps, bool yuv444)

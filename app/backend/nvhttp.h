@@ -170,7 +170,9 @@ public:
              bool localAudio,
              int gamepadMask,
              bool persistGameControllersOnDisconnect,
-             QString& rtspSessionUrl);
+             QString& rtspSessionUrl,
+             const QString& sdsChromaMode = QString(),
+             QString extraQueryParams = QString());
 
     QVector<NvApp>
     getAppList();
@@ -185,9 +187,6 @@ public:
     QUrl m_BaseUrlHttp;
     QUrl m_BaseUrlHttps;
 private:
-    void
-    handleSslErrors(QNetworkReply* reply, const QList<QSslError>& errors);
-
     QNetworkReply*
     openConnection(QUrl baseUrl,
                    QString command,

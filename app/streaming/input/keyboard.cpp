@@ -1,4 +1,7 @@
 #include "streaming/session.h"
+#include "keymapping.h"
+#include "streaming/sds/sdssession.h"
+#include "streaming/audio/micsession.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -177,6 +180,24 @@ void SdlInputHandler::performSpecialKeyCombo(KeyCombo combo)
         updateKeyboardGrabState();
         break;
 
+    case KeyComboSdsDownloadOutbox:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Detected download outbox combo");
+        if (Session::get()->m_Sds != nullptr) {
+            Session::get()->m_Sds->downloadOutboxNow();
+        }
+        break;
+
+    case KeyComboToggleMicMute:
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Detected microphone mute toggle combo");
+
+        // secure-desktop-stream: no-op when microphone passthrough is not active
+        if (Session::s_ActiveSession->m_Mic != nullptr) {
+            Session::s_ActiveSession->m_Mic->toggleMute();
+        }
+        break;
+
     default:
         Q_UNREACHABLE();
     }
@@ -225,6 +246,13 @@ void SdlInputHandler::handleKeyEvent(SDL_KeyboardEvent* event)
             }
         }
     }
+
+    // Optionally swap Command and Control (macOS only) so Cmd+C/V/Z/A arrive on the
+    // host as Ctrl+C/V/Z/A. This works on a local copy of the event and happens after
+    // the special key combos above, which keep using the physical Control key.
+    SDL_KeyboardEvent mappedEvent = *event;
+    mappedEvent.keysym = KeyMapping::applyCmdCtrlSwap(event->keysym, m_SwapCmdCtrl);
+    event = &mappedEvent;
 
     // Set modifier flags
     modifiers = 0;

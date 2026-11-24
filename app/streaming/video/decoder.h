@@ -34,17 +34,20 @@ typedef struct _VIDEO_STATS {
 } VIDEO_STATS, *PVIDEO_STATS;
 
 typedef struct _DECODER_PARAMETERS {
-    SDL_Window* window;
-    StreamingPreferences::VideoDecoderSelection vds;
-    StreamingPreferences::RendererSelection renderer;
+    SDL_Window* window = nullptr;
+    StreamingPreferences::VideoDecoderSelection vds = StreamingPreferences::VDS_AUTO;
+    StreamingPreferences::RendererSelection renderer = StreamingPreferences::RS_AUTO;
 
-    int videoFormat;
-    int width;
-    int height;
-    int frameRate;
-    bool enableVsync;
-    bool enableFramePacing;
-    bool testOnly;
+    int videoFormat = 0;
+    int width = 0;
+    int height = 0;
+    int frameRate = 0;
+    bool enableVsync = false;
+    bool enableFramePacing = false;
+    bool testOnly = false;
+    int packedYCoCgRMode = 0;
+    int logicalWidth = 0;
+    int logicalHeight = 0;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
 
 #define WINDOW_STATE_CHANGE_SIZE 0x01

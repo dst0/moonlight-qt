@@ -2,7 +2,6 @@
 
 #include "nvcomputer.h"
 #include "settings/streamingpreferences.h"
-#include "settings/compatfetcher.h"
 
 #include <qmdnsengine/server.h>
 #include <qmdnsengine/cache.h>
@@ -265,7 +264,7 @@ private:
 
     void saveHost(NvComputer* computer);
 
-    QHostAddress getBestGlobalAddressV6(QVector<QHostAddress>& addresses);
+    QHostAddress getBestLanAddressV6(QVector<QHostAddress>& addresses);
 
     void startPollingComputer(NvComputer* computer);
 
@@ -278,7 +277,6 @@ private:
     QSharedPointer<QMdnsEngine::Server> m_MdnsServer;
     QMdnsEngine::Browser* m_MdnsBrowser;
     QVector<MdnsPendingComputer*> m_PendingResolution;
-    CompatFetcher m_CompatFetcher;
     DelayedFlushThread* m_DelayedFlushThread;
     QMutex m_DelayedFlushMutex; // Lock ordering: Must never be acquired while holding NvComputer lock
     QWaitCondition m_DelayedFlushCondition;

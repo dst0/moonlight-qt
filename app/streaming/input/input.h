@@ -168,6 +168,8 @@ private:
         KeyComboTogglePointerRegionLock,
         KeyComboQuitAndExit,
         KeyComboToggleKeyboardGrab,
+        KeyComboSdsDownloadOutbox, // secure-desktop-stream
+        KeyComboToggleMicMute, // secure-desktop-stream
         KeyComboMax
     };
 
@@ -207,6 +209,7 @@ private:
     bool m_MultiController;
     bool m_GamepadMouse;
     bool m_SwapMouseButtons;
+    bool m_SwapCmdCtrl;
     bool m_ReverseScrollDirection;
     bool m_SwapFaceButtons;
 

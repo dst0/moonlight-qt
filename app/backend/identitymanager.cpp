@@ -1,8 +1,14 @@
 #include "identitymanager.h"
 #include "utils.h"
 
-#include <QDebug>
+#ifdef Q_OS_DARWIN
+#include "keychain_mac.h"
+#endif
 
+#include <QDebug>
+#include <stdexcept>
+
+#include <openssl/crypto.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
@@ -20,7 +26,12 @@ IdentityManager::get()
     // This will always be called first on the main thread,
     // so it's safe to initialize without locks.
     if (s_Im == nullptr) {
-        s_Im = new IdentityManager();
+        QSettings settings;
+#ifdef Q_OS_DARWIN
+        s_Im = new IdentityManager(settings, Keychain::identityServiceForProfile(settings.fileName()));
+#else
+        s_Im = new IdentityManager(settings, QString());
+#endif
     }
 
     return s_Im;
@@ -84,6 +95,7 @@ void IdentityManager::createCredentials(QSettings& settings)
     BIO_get_mem_ptr(biokey, &mem);
     m_CachedPrivateKey = QByteArray(mem->data, (int)mem->length);
     m_CachedSslKey = QSslKey();
+    OPENSSL_cleanse(mem->data, mem->length);
 
     BIO_get_mem_ptr(biocert, &mem);
     m_CachedPemCert = QByteArray(mem->data, (int)mem->length);
@@ -102,18 +114,163 @@ void IdentityManager::createCredentials(QSettings& settings)
         qFatal("Newly generated private key is unreadable");
     }
 
+#ifdef Q_OS_DARWIN
+    // The private key is persisted only in the Keychain. Store it before the certificate:
+    // if we are interrupted in between, the old certificate no longer matches the new key
+    // and the next start either migrates the old plaintext key or regenerates.
+    storeKeychainPrivateKey(m_CachedPrivateKey);
+    settings.setValue(SER_CERT, m_CachedPemCert);
+    removePlaintextKey(settings);
+
+    qInfo() << "Wrote new identity credentials (private key in the macOS Keychain)";
+#else
     settings.setValue(SER_CERT, m_CachedPemCert);
     settings.setValue(SER_KEY, m_CachedPrivateKey);
 
     qInfo() << "Wrote new identity credentials to settings";
+#endif
 }
 
-IdentityManager::IdentityManager()
+bool IdentityManager::isMatchingKeyPair(const QByteArray& certPem, const QByteArray& keyPem)
 {
-    QSettings settings;
+    if (certPem.isEmpty() || keyPem.isEmpty()) {
+        return false;
+    }
 
+    BIO* bio = BIO_new_mem_buf(certPem.constData(), certPem.size());
+    THROW_BAD_ALLOC_IF_NULL(bio);
+    X509* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (cert == nullptr) {
+        return false;
+    }
+
+    bio = BIO_new_mem_buf(keyPem.constData(), keyPem.size());
+    THROW_BAD_ALLOC_IF_NULL(bio);
+    EVP_PKEY* pk = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (pk == nullptr) {
+        X509_free(cert);
+        return false;
+    }
+
+    bool matches = X509_check_private_key(cert, pk) == 1;
+
+    EVP_PKEY_free(pk);
+    X509_free(cert);
+    return matches;
+}
+
+#ifdef Q_OS_DARWIN
+QByteArray IdentityManager::loadKeychainPrivateKey(QSettings& settings)
+{
+    QByteArray keychainKey;
+    QString error;
+    Keychain::Status status = Keychain::read(m_KeychainService, Keychain::ClientKeyAccount, keychainKey, &error);
+    if (status == Keychain::Status::Error) {
+        // Never fall back to a plaintext key or silently regenerate (which would unpair all hosts)
+        qFatal("Unable to read the client private key from the macOS Keychain: %s", qPrintable(error));
+    }
+
+    QByteArray plaintextKey = readPlaintextKey(settings);
+
+    if (status == Keychain::Status::Ok && isMatchingKeyPair(m_CachedPemCert, keychainKey)) {
+        if (!plaintextKey.isEmpty()) {
+            // Leftover from an interrupted migration or an older client version
+            qInfo() << "Removing a plaintext private key from settings; the Keychain copy is used";
+            removePlaintextKey(settings);
+        }
+        plaintextKey.fill('\0');
+        return keychainKey;
+    }
+
+    if (isMatchingKeyPair(m_CachedPemCert, plaintextKey)) {
+        qInfo() << "Migrating the client private key from settings to the macOS Keychain";
+        storeKeychainPrivateKey(plaintextKey);
+        removePlaintextKey(settings);
+        keychainKey.fill('\0');
+        return plaintextKey;
+    }
+
+    if (status == Keychain::Status::Ok) {
+        qWarning() << "The private key in the macOS Keychain does not match the certificate";
+    }
+    if (!plaintextKey.isEmpty()) {
+        qWarning() << "The plaintext private key in settings does not match the certificate";
+    }
+    const bool hasAnyIdentity = !m_CachedPemCert.isEmpty() || status == Keychain::Status::Ok || !plaintextKey.isEmpty();
+    keychainKey.fill('\0');
+    plaintextKey.fill('\0');
+    if (hasAnyIdentity) {
+        throw std::runtime_error("The pairing certificate or key for this profile is missing or does not match. "
+                                 "Restore the matching certificate and Keychain item or use a new profile. "
+                                 "Existing pairings have been preserved.");
+    }
+
+    // No usable key; new credentials will be generated (and the plaintext key removed)
+    return QByteArray();
+}
+
+void IdentityManager::storeKeychainPrivateKey(const QByteArray& key)
+{
+    QString error;
+    if (Keychain::write(m_KeychainService, Keychain::ClientKeyAccount, key, &error) != Keychain::Status::Ok) {
+        qFatal("Unable to store the client private key in the macOS Keychain: %s", qPrintable(error));
+    }
+
+    // Read it back to be sure the Keychain really holds this key before the
+    // plaintext copy is deleted
+    QByteArray readBack;
+    if (Keychain::read(m_KeychainService, Keychain::ClientKeyAccount, readBack, &error) != Keychain::Status::Ok) {
+        readBack.fill('\0');
+        qFatal("Unable to read back the client private key from the macOS Keychain: %s", qPrintable(error));
+    }
+    const bool matches = (readBack == key);
+    readBack.fill('\0');
+    if (!matches) {
+        qFatal("The client private key read back from the macOS Keychain differs from the stored key");
+    }
+}
+
+// Only Moonlight's own settings location is considered: fallback locations (organization
+// or system-wide defaults) are never written by Moonlight and cannot be cleaned up by it.
+QByteArray IdentityManager::readPlaintextKey(QSettings& settings)
+{
+    bool fallbacksEnabled = settings.fallbacksEnabled();
+    settings.setFallbacksEnabled(false);
+    QByteArray key = settings.value(SER_KEY).toByteArray();
+    settings.setFallbacksEnabled(fallbacksEnabled);
+    return key;
+}
+
+void IdentityManager::removePlaintextKey(QSettings& settings)
+{
+    bool fallbacksEnabled = settings.fallbacksEnabled();
+    settings.setFallbacksEnabled(false);
+    settings.remove(SER_KEY);
+    settings.sync();
+    bool removed = settings.status() == QSettings::NoError && !settings.contains(SER_KEY);
+    settings.setFallbacksEnabled(fallbacksEnabled);
+
+    if (!removed) {
+        qFatal("Unable to remove the plaintext client private key from settings (status %d)", (int)settings.status());
+    }
+}
+#endif
+
+IdentityManager::IdentityManager(QSettings& settings, const QString& keychainService)
+#ifdef Q_OS_DARWIN
+    : m_KeychainService(keychainService)
+#endif
+{
     m_CachedPemCert = settings.value(SER_CERT).toByteArray();
+#ifdef Q_OS_DARWIN
+    Q_ASSERT(!m_KeychainService.isEmpty());
+    m_CachedPrivateKey = loadKeychainPrivateKey(settings);
+#else
+    Q_UNUSED(keychainService);
     m_CachedPrivateKey = settings.value(SER_KEY).toByteArray();
+#endif
 
     if (m_CachedPemCert.isEmpty() || m_CachedPrivateKey.isEmpty()) {
         qInfo() << "No existing credentials found";
@@ -150,6 +307,13 @@ IdentityManager::IdentityManager()
         qInfo() << "Generated new unique ID:" << m_CachedUniqueId;
 
         settings.setValue(SER_UNIQUEID, m_CachedUniqueId);
+    }
+}
+
+IdentityManager::~IdentityManager()
+{
+    if (!m_CachedPrivateKey.isEmpty()) {
+        m_CachedPrivateKey.fill('\0');
     }
 }
 
@@ -192,7 +356,10 @@ IdentityManager::getSslKey()
 
         BUF_MEM* mem;
         BIO_get_mem_ptr(bio, &mem);
-        m_CachedSslKey = QSslKey(QByteArray(mem->data, (int)mem->length), getSslCertificate().publicKey().algorithm());
+        QByteArray pkcs1Pem(mem->data, (int)mem->length);
+        m_CachedSslKey = QSslKey(pkcs1Pem, getSslCertificate().publicKey().algorithm());
+        pkcs1Pem.fill('\0');
+        OPENSSL_cleanse(mem->data, mem->length);
 
         BIO_free(bio);
         EVP_PKEY_free(pk);

@@ -1,6 +1,7 @@
 #include "computermodel.h"
 
 #include <QThreadPool>
+#include <QCryptographicHash>
 
 ComputerModel::ComputerModel(QObject* object)
     : QAbstractListModel(object) {}
@@ -42,6 +43,40 @@ QVariant ComputerModel::data(const QModelIndex& index, int role) const
         return computer->state == NvComputer::CS_UNKNOWN;
     case ServerSupportedRole:
         return computer->isSupportedServerVersion;
+    case FileClipboardApprovedRole:
+        return !computer->serverCert.isNull() && computer->pairState == NvComputer::PS_PAIRED &&
+                StreamingPreferences::get()->fileClipboardHosts.contains(QString::fromLatin1(
+                    computer->serverCert.digest(QCryptographicHash::Sha256).toHex()));
+    case HasMultipleAdaptersRole:
+        return computer->pairState == NvComputer::PS_PAIRED && computer->sdsAdapters.size() > 1;
+    case HasHostCaptureAdapterRole:
+        return computer->pairState == NvComputer::PS_PAIRED &&
+               !computer->isNvidiaServerSoftware &&
+               computer->hasSdsFeature(QStringLiteral("host_capture_adapter"));
+    case AdaptersRole: {
+        QVariantList list;
+        for (const NvHostAdapter& adapter : computer->sdsAdapters) {
+            QVariantMap entry;
+            entry.insert("id", adapter.id);
+            entry.insert("name", adapter.name);
+            entry.insert("pciSlot", adapter.pciSlot);
+            entry.insert("isDefault", adapter.isDefault);
+            entry.insert("isCaptureDefault", adapter.isCaptureDefault);
+            list.append(entry);
+        }
+        return list;
+    }
+    case SelectedAdapterIdRole:
+    case SelectedCaptureAdapterIdRole: {
+        if (computer->serverCert.isNull() || computer->pairState != NvComputer::PS_PAIRED) {
+            return QString();
+        }
+        QString fp = QString::fromLatin1(computer->serverCert.digest(QCryptographicHash::Sha256).toHex());
+        auto prefs = StreamingPreferences::get();
+        return role == SelectedCaptureAdapterIdRole
+                ? prefs->hostCaptureAdapterOverride(fp)
+                : prefs->hostAdapterOverride(fp);
+    }
     case DetailsRole: {
         QString state, pairState;
 
@@ -110,8 +145,70 @@ QHash<int, QByteArray> ComputerModel::roleNames() const
     names[StatusUnknownRole] = "statusUnknown";
     names[ServerSupportedRole] = "serverSupported";
     names[DetailsRole] = "details";
+    names[FileClipboardApprovedRole] = "fileClipboardApproved";
+    names[HasMultipleAdaptersRole] = "hasMultipleAdapters";
+    names[AdaptersRole] = "adapters";
+    names[SelectedAdapterIdRole] = "selectedAdapterId";
+    names[HasHostCaptureAdapterRole] = "hasHostCaptureAdapter";
+    names[SelectedCaptureAdapterIdRole] = "selectedCaptureAdapterId";
 
     return names;
+}
+
+QString ComputerModel::fileClipboardFingerprint(int computerIndex) const
+{
+    if (computerIndex < 0 || computerIndex >= m_Computers.size()) return {};
+    const auto computer = m_Computers[computerIndex];
+    QReadLocker lock(&computer->lock);
+    if (computer->pairState != NvComputer::PS_PAIRED || computer->serverCert.isNull()) return {};
+    return QString::fromLatin1(computer->serverCert.digest(QCryptographicHash::Sha256).toHex());
+}
+
+void ComputerModel::setHostAdapter(int computerIndex, QString adapterId)
+{
+    const auto fingerprint = fileClipboardFingerprint(computerIndex);
+    if (fingerprint.isEmpty()) {
+        return;
+    }
+    auto prefs = StreamingPreferences::get();
+    prefs->setHostAdapterOverride(fingerprint, adapterId);
+    prefs->save();
+    emit dataChanged(index(computerIndex), index(computerIndex), {SelectedAdapterIdRole});
+}
+
+void ComputerModel::setHostCaptureAdapter(int computerIndex, QString adapterId)
+{
+    const auto fingerprint = fileClipboardFingerprint(computerIndex);
+    if (fingerprint.isEmpty()) {
+        return;
+    }
+    auto prefs = StreamingPreferences::get();
+    prefs->setHostCaptureAdapterOverride(fingerprint, adapterId);
+    prefs->save();
+    emit dataChanged(index(computerIndex), index(computerIndex), {SelectedCaptureAdapterIdRole});
+}
+
+bool ComputerModel::setFileClipboardApproval(int computerIndex, QString expectedFingerprint, bool approved)
+{
+    const auto fingerprint = fileClipboardFingerprint(computerIndex);
+    if (fingerprint.isEmpty() || fingerprint != expectedFingerprint) return false;
+    auto prefs = StreamingPreferences::get();
+    prefs->fileClipboardHosts.removeAll(fingerprint);
+    prefs->fileClipboardHosts.removeAll(QString());
+    prefs->fileClipboardHosts.removeDuplicates();
+    if (approved) {
+        const bool hasOtherHosts = !prefs->fileClipboardHosts.isEmpty();
+        prefs->fileClipboardHosts.append(fingerprint);
+        // Never silently re-enable the global toggle if the user turned it off while other
+        // approved hosts remained in fileClipboardHosts.
+        if (!prefs->fileClipboard && !hasOtherHosts) {
+            prefs->fileClipboard = true;
+            emit prefs->fileClipboardChanged();
+        }
+    }
+    prefs->save();
+    emit dataChanged(index(computerIndex), index(computerIndex), {FileClipboardApprovedRole});
+    return true;
 }
 
 Session* ComputerModel::createSessionForCurrentGame(int computerIndex)
@@ -184,35 +281,6 @@ QString ComputerModel::generatePinString()
     return m_ComputerManager->generatePinString();
 }
 
-class DeferredTestConnectionTask : public QObject, public QRunnable
-{
-    Q_OBJECT
-public:
-    void run()
-    {
-        unsigned int portTestResult = LiTestClientConnectivity("qt.conntest.moonlight-stream.org", 443, ML_PORT_FLAG_ALL);
-        if (portTestResult == ML_TEST_RESULT_INCONCLUSIVE) {
-            emit connectionTestCompleted(-1, QString());
-        }
-        else {
-            char blockedPorts[512];
-            LiStringifyPortFlags(portTestResult, "\n", blockedPorts, sizeof(blockedPorts));
-            emit connectionTestCompleted(portTestResult, QString(blockedPorts));
-        }
-    }
-
-signals:
-    void connectionTestCompleted(int result, QString blockedPorts);
-};
-
-void ComputerModel::testConnectionForComputer(int)
-{
-    DeferredTestConnectionTask* testConnectionTask = new DeferredTestConnectionTask();
-    QObject::connect(testConnectionTask, &DeferredTestConnectionTask::connectionTestCompleted,
-                     this, &ComputerModel::connectionTestCompleted);
-    QThreadPool::globalInstance()->start(testConnectionTask);
-}
-
 void ComputerModel::pairComputer(int computerIndex, QString pin)
 {
     Q_ASSERT(computerIndex >= 0 && computerIndex < m_Computers.count());
@@ -241,5 +309,3 @@ void ComputerModel::handleComputerStateChanged(NvComputer* computer)
         emit dataChanged(createIndex(index, 0), createIndex(index, 0));
     }
 }
-
-#include "computermodel.moc"

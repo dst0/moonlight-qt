@@ -16,7 +16,13 @@ class ComputerModel : public QAbstractListModel
         WakeableRole,
         StatusUnknownRole,
         ServerSupportedRole,
-        DetailsRole
+        DetailsRole,
+        FileClipboardApprovedRole,
+        HasMultipleAdaptersRole,
+        AdaptersRole,
+        SelectedAdapterIdRole,
+        HasHostCaptureAdapterRole,
+        SelectedCaptureAdapterIdRole
     };
 
 public:
@@ -37,17 +43,19 @@ public:
 
     Q_INVOKABLE void pairComputer(int computerIndex, QString pin);
 
-    Q_INVOKABLE void testConnectionForComputer(int computerIndex);
 
     Q_INVOKABLE void wakeComputer(int computerIndex);
 
     Q_INVOKABLE void renameComputer(int computerIndex, QString name);
+    Q_INVOKABLE QString fileClipboardFingerprint(int computerIndex) const;
+    Q_INVOKABLE bool setFileClipboardApproval(int computerIndex, QString expectedFingerprint, bool approved);
+    Q_INVOKABLE void setHostAdapter(int computerIndex, QString adapterId);
+    Q_INVOKABLE void setHostCaptureAdapter(int computerIndex, QString adapterId);
 
     Q_INVOKABLE Session* createSessionForCurrentGame(int computerIndex);
 
 signals:
     void pairingCompleted(QVariant error);
-    void connectionTestCompleted(int result, QString blockedPorts);
 
 private slots:
     void handleComputerStateChanged(NvComputer* computer);

@@ -354,6 +354,7 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addChoiceOption("audio-config", "audio config", m_AudioConfigMap.keys());
     parser.addToggleOption("multi-controller", "multiple controller support");
     parser.addToggleOption("quit-after", "quit app after session");
+    parser.addFlagOption("no-microphone", "disable microphone passthrough for this session");
     parser.addToggleOption("absolute-mouse", "remote desktop optimized mouse control");
     parser.addToggleOption("mouse-buttons-swap", "left and right mouse buttons swap");
     parser.addToggleOption("touchscreen-trackpad", "touchscreen in trackpad mode");
@@ -445,6 +446,10 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
 
     // Resolve --multi-controller and --no-multi-controller options
     preferences->multiController = parser.getToggleOptionValue("multi-controller", preferences->multiController);
+
+    if (parser.isSet("no-microphone")) {
+        preferences->micPassthrough = false;
+    }
 
     // Resolve --quit-after and --no-quit-after options
     preferences->quitAppAfter = parser.getToggleOptionValue("quit-after", preferences->quitAppAfter);

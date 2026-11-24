@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "streaming/session.h"
 
+#include <memory>
 #include <h264_stream.h>
 
 extern "C" {
@@ -240,6 +241,11 @@ FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
       m_FramesOut(0),
       m_LastFrameNumber(0),
       m_StreamFps(0),
+      m_OriginalVideoWidth(0),
+      m_OriginalVideoHeight(0),
+      m_PackedYCoCgRMode(0),
+      m_LogicalWidth(0),
+      m_LogicalHeight(0),
       m_VideoFormat(0),
       m_NeedsSpsFixup(false),
       m_TestOnly(testOnly),
@@ -494,6 +500,9 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     m_RequiredPixelFormat = requiredFormat;
     m_OriginalVideoWidth = params->width;
     m_OriginalVideoHeight = params->height;
+    m_PackedYCoCgRMode = params->packedYCoCgRMode;
+    m_LogicalWidth = params->logicalWidth;
+    m_LogicalHeight = params->logicalHeight;
     m_StreamFps = params->frameRate;
     m_VideoFormat = params->videoFormat;
     m_CurrentTestMode = testMode;
@@ -806,72 +815,77 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
     // Start with an empty string
     output[offset] = 0;
 
-    switch (m_VideoFormat)
-    {
-    case VIDEO_FORMAT_H264:
-        codecString = "H.264";
-        break;
+    if (m_PackedYCoCgRMode == 1) {
+        codecString = "HEVC Packed YCoCg-R 4:4:4";
+    }
+    else {
+        switch (m_VideoFormat)
+        {
+        case VIDEO_FORMAT_H264:
+            codecString = "H.264";
+            break;
 
-    case VIDEO_FORMAT_H264_HIGH8_444:
-        codecString = "H.264 4:4:4";
-        break;
+        case VIDEO_FORMAT_H264_HIGH8_444:
+            codecString = "H.264 4:4:4";
+            break;
 
-    case VIDEO_FORMAT_H265:
-        codecString = "HEVC";
-        break;
+        case VIDEO_FORMAT_H265:
+            codecString = "HEVC";
+            break;
 
-    case VIDEO_FORMAT_H265_REXT8_444:
-        codecString = "HEVC 4:4:4";
-        break;
+        case VIDEO_FORMAT_H265_REXT8_444:
+            codecString = "HEVC 4:4:4";
+            break;
 
-    case VIDEO_FORMAT_H265_MAIN10:
-        if (LiGetCurrentHostDisplayHdrMode()) {
-            codecString = "HEVC 10-bit HDR";
+        case VIDEO_FORMAT_H265_MAIN10:
+            if (LiGetCurrentHostDisplayHdrMode()) {
+                codecString = "HEVC 10-bit HDR";
+            }
+            else {
+                codecString = "HEVC 10-bit SDR";
+            }
+            break;
+
+        case VIDEO_FORMAT_H265_REXT10_444:
+            if (LiGetCurrentHostDisplayHdrMode()) {
+                codecString = "HEVC 10-bit HDR 4:4:4";
+            }
+            else {
+                codecString = "HEVC 10-bit SDR 4:4:4";
+            }
+            break;
+
+        case VIDEO_FORMAT_AV1_MAIN8:
+            codecString = "AV1";
+            break;
+
+        case VIDEO_FORMAT_AV1_HIGH8_444:
+            codecString = "AV1 4:4:4";
+            break;
+
+        case VIDEO_FORMAT_AV1_MAIN10:
+            if (LiGetCurrentHostDisplayHdrMode()) {
+                codecString = "AV1 10-bit HDR";
+            }
+            else {
+                codecString = "AV1 10-bit SDR";
+            }
+            break;
+
+        case VIDEO_FORMAT_AV1_HIGH10_444:
+            if (LiGetCurrentHostDisplayHdrMode()) {
+                codecString = "AV1 10-bit HDR 4:4:4";
+            }
+            else {
+                codecString = "AV1 10-bit SDR 4:4:4";
+            }
+            break;
+
+        default:
+            SDL_assert(false);
+            codecString = "UNKNOWN";
+            break;
         }
-        else {
-            codecString = "HEVC 10-bit SDR";
-        }
-        break;
-
-    case VIDEO_FORMAT_H265_REXT10_444:
-        if (LiGetCurrentHostDisplayHdrMode()) {
-            codecString = "HEVC 10-bit HDR 4:4:4";
-        }
-        else {
-            codecString = "HEVC 10-bit SDR 4:4:4";
-        }
-        break;
-
-    case VIDEO_FORMAT_AV1_MAIN8:
-        codecString = "AV1";
-        break;
-
-    case VIDEO_FORMAT_AV1_HIGH8_444:
-        codecString = "AV1 4:4:4";
-        break;
-
-    case VIDEO_FORMAT_AV1_MAIN10:
-        if (LiGetCurrentHostDisplayHdrMode()) {
-            codecString = "AV1 10-bit HDR";
-        }
-        else {
-            codecString = "AV1 10-bit SDR";
-        }
-        break;
-
-    case VIDEO_FORMAT_AV1_HIGH10_444:
-        if (LiGetCurrentHostDisplayHdrMode()) {
-            codecString = "AV1 10-bit HDR 4:4:4";
-        }
-        else {
-            codecString = "AV1 10-bit SDR 4:4:4";
-        }
-        break;
-
-    default:
-        SDL_assert(false);
-        codecString = "UNKNOWN";
-        break;
     }
 
     if (stats.receivedFps > 0) {
@@ -880,6 +894,12 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             double avgVideoMbps = m_BwTracker.GetAverageMbps();
             double peakVideoMbps = m_BwTracker.GetPeakMbps();
 #endif
+            const int displayWidth = (m_PackedYCoCgRMode == 1 && m_LogicalWidth > 0)
+                ? m_LogicalWidth
+                : m_VideoDecoderCtx->width;
+            const int displayHeight = (m_PackedYCoCgRMode == 1 && m_LogicalHeight > 0)
+                ? m_LogicalHeight
+                : m_VideoDecoderCtx->height;
 
             ret = snprintf(&output[offset],
                            length - offset,
@@ -888,8 +908,8 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                            "Bitrate: %.1f Mbps, Peak (%us): %.1f\n"
 #endif
                            ,
-                           m_VideoDecoderCtx->width,
-                           m_VideoDecoderCtx->height,
+                           displayWidth,
+                           displayHeight,
                            stats.totalFps,
                            codecString
 #ifdef DISPLAY_BITRATE
@@ -1002,6 +1022,13 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef Q_OS_DARWIN
         case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
+            if (params->packedYCoCgRMode != 0) {
+                if (params->renderer == StreamingPreferences::RS_VULKAN ||
+                    params->renderer == StreamingPreferences::RS_AVSBDL) {
+                    return nullptr;
+                }
+                return VTMetalRendererFactory::createRenderer(true);
+            }
             // Prefer the libplacebo (on MoltenVK) renderer unless explicitly opted out
 #ifdef HAVE_LIBPLACEBO_VULKAN
             if (params->renderer == StreamingPreferences::RS_AUTO || params->renderer == StreamingPreferences::RS_VULKAN) {
@@ -1064,6 +1091,9 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef Q_OS_DARWIN
         case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
+            if (params->packedYCoCgRMode != 0) {
+                return nullptr;
+            }
             // Use the older AVSampleBufferDisplayLayer if Metal cannot be used
             return VTRendererFactory::createRenderer();
 #endif
@@ -1347,6 +1377,37 @@ bool FFmpegVideoDecoder::tryInitializeRendererForUnknownDecoder(const AVCodec* d
                 }
             }
         }
+    }
+
+    if (params->packedYCoCgRMode != 0) {
+#ifdef Q_OS_DARWIN
+        if (params->renderer == StreamingPreferences::RS_VULKAN ||
+            params->renderer == StreamingPreferences::RS_AVSBDL) {
+            return false;
+        }
+        if (decoder_pix_fmts == NULL) {
+            return tryInitializeRenderer(decoder, AV_PIX_FMT_NONE, params, nullptr, nullptr,
+                                         []() -> IFFmpegRenderer* { return VTMetalRendererFactory::createRenderer(false); });
+        }
+
+        std::unique_ptr<IFFmpegRenderer> probeRenderer(VTMetalRendererFactory::createRenderer(false));
+        for (int i = 0; decoder_pix_fmts[i] != AV_PIX_FMT_NONE; i++) {
+            if (probeRenderer->getPreferredPixelFormat(params->videoFormat) == decoder_pix_fmts[i] &&
+                tryInitializeRenderer(decoder, decoder_pix_fmts[i], params, nullptr, nullptr,
+                                      []() -> IFFmpegRenderer* { return VTMetalRendererFactory::createRenderer(false); })) {
+                return true;
+            }
+        }
+        for (int i = 0; decoder_pix_fmts[i] != AV_PIX_FMT_NONE; i++) {
+            if (decoder_pix_fmts[i] != probeRenderer->getPreferredPixelFormat(params->videoFormat) &&
+                probeRenderer->isPixelFormatSupported(params->videoFormat, decoder_pix_fmts[i]) &&
+                tryInitializeRenderer(decoder, decoder_pix_fmts[i], params, nullptr, nullptr,
+                                      []() -> IFFmpegRenderer* { return VTMetalRendererFactory::createRenderer(false); })) {
+                return true;
+            }
+        }
+#endif
+        return false;
     }
 
     if (decoder_pix_fmts == NULL) {
@@ -1940,7 +2001,8 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     // to crop it off. If we find our received frame looks close to our requested
                     // size (where "close" is arbitrarily defined as "within 64 pixels") then just
                     // crop the video to our requested size instead.
-                    if (frame->width != m_OriginalVideoWidth || frame->height != m_OriginalVideoHeight) {
+                    if (m_PackedYCoCgRMode == 0 &&
+                        (frame->width != m_OriginalVideoWidth || frame->height != m_OriginalVideoHeight)) {
                         int cropWidth = frame->width - m_OriginalVideoWidth;
                         int cropHeight = frame->height - m_OriginalVideoHeight;
 

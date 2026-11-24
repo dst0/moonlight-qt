@@ -78,7 +78,6 @@ CenteredGridView {
         var model = Qt.createQmlObject('import ComputerModel 1.0; ComputerModel {}', parent, '')
         model.initialize(ComputerManager)
         model.pairingCompleted.connect(pairingComplete)
-        model.connectionTestCompleted.connect(testConnectionDialog.connectionTestComplete)
         return model
     }
 
@@ -192,14 +191,6 @@ CenteredGridView {
                     visible: !model.online && model.wakeable
                 }
                 NavigableMenuItem {
-                    text: qsTr("Test Network")
-                    onTriggered: {
-                        computerModel.testConnectionForComputer(index)
-                        testConnectionDialog.open()
-                    }
-                }
-
-                NavigableMenuItem {
                     text: qsTr("Rename PC")
                     onTriggered: {
                         renamePcDialog.pcIndex = index
@@ -220,6 +211,43 @@ CenteredGridView {
                     onTriggered: {
                         showPcDetailsDialog.pcDetails = model.details
                         showPcDetailsDialog.open()
+                    }
+                }
+                NavigableMenuItem {
+                    visible: model.paired
+                    text: model.fileClipboardApproved ? qsTr("Revoke File Clipboard") : qsTr("Approve File Clipboard")
+                    onTriggered: {
+                        var fingerprint = computerModel.fileClipboardFingerprint(index)
+                        if (model.fileClipboardApproved) {
+                            computerModel.setFileClipboardApproval(index, fingerprint, false)
+                        } else {
+                            fileClipboardApprovalDialog.pcIndex = index
+                            fileClipboardApprovalDialog.pcName = model.name
+                            fileClipboardApprovalDialog.fingerprint = fingerprint
+                            fileClipboardApprovalDialog.open()
+                        }
+                    }
+                }
+                NavigableMenuItem {
+                    visible: model.paired && model.hasMultipleAdapters
+                    text: qsTr("Host Encoder GPU...")
+                    onTriggered: {
+                        hostAdapterDialog.pcIndex = index
+                        hostAdapterDialog.pcName = model.name
+                        hostAdapterDialog.adapters = model.adapters
+                        hostAdapterDialog.selectedAdapterId = resolveSelectedAdapterId(model.adapters, model.selectedAdapterId)
+                        hostAdapterDialog.open()
+                    }
+                }
+                NavigableMenuItem {
+                    visible: model.paired && model.hasMultipleAdapters && model.hasHostCaptureAdapter
+                    text: qsTr("Host X11 / Capture GPU...")
+                    onTriggered: {
+                        hostCaptureAdapterDialog.pcIndex = index
+                        hostCaptureAdapterDialog.pcName = model.name
+                        hostCaptureAdapterDialog.adapters = model.adapters
+                        hostCaptureAdapterDialog.selectedAdapterId = resolveSelectedAdapterId(model.adapters, model.selectedCaptureAdapterId)
+                        hostCaptureAdapterDialog.open()
                     }
                 }
             }
@@ -322,33 +350,106 @@ CenteredGridView {
     }
 
     NavigableMessageDialog {
-        id: testConnectionDialog
-        closePolicy: Popup.CloseOnEscape
-        standardButtons: Dialog.Ok
+        id: fileClipboardApprovalDialog
+        property int pcIndex: -1
+        property string pcName: ""
+        property string fingerprint: ""
+        text: qsTr("Allow file Copy/Paste with '%1'?").arg(pcName) + "\n\n" +
+              qsTr("While streaming with clipboard and file transfer enabled, copying files exchanges metadata first and transfers bytes on demand at Paste. Paste chooses the final folder. This approval applies only to its current pairing certificate. Folders and Cut are unsupported.")
+        standardButtons: Dialog.Yes | Dialog.No
+        onAccepted: computerModel.setFileClipboardApproval(pcIndex, fingerprint, true)
+    }
 
-        onAboutToShow: {
-            testConnectionDialog.text = qsTr("Moonlight is testing your network connection to determine if any required ports are blocked.") + "\n\n" + qsTr("This may take a few seconds…")
-            showSpinner = true
+    function resolveSelectedAdapterId(adapters, selected) {
+        var id = selected || ""
+        for (var i = 0; i < adapters.length; i++) {
+            if (adapters[i].id === id) {
+                return id
+            }
+        }
+        return ""
+    }
+
+    NavigableDialog {
+        id: hostAdapterDialog
+        property int pcIndex: -1
+        property string pcName: ""
+        property var adapters: []
+        property string selectedAdapterId: ""
+
+        standardButtons: Dialog.Ok | Dialog.Cancel
+
+        onAccepted: {
+            if (pcIndex >= 0) {
+                computerModel.setHostAdapter(pcIndex, selectedAdapterId)
+            }
         }
 
-        function connectionTestComplete(result, blockedPorts)
-        {
-            if (result === -1) {
-                text = qsTr("The network test could not be performed because none of Moonlight's connection testing servers were reachable from this PC. Check your Internet connection or try again later.")
-                imageSrc = "qrc:/res/baseline-warning-24px.svg"
-            }
-            else if (result === 0) {
-                text = qsTr("This network does not appear to be blocking Moonlight. If you still have trouble connecting, check your PC's firewall settings.") + "\n\n" + qsTr("If you are trying to stream over the Internet, install the Moonlight Internet Hosting Tool on your gaming PC and run the included Internet Streaming Tester to check your gaming PC's Internet connection.")
-                imageSrc = "qrc:/res/baseline-check_circle_outline-24px.svg"
-            }
-            else {
-                text = qsTr("Your PC's current network connection seems to be blocking Moonlight. Streaming over the Internet may not work while connected to this network.") + "\n\n" + qsTr("The following network ports were blocked:") + "\n"
-                text += blockedPorts
-                imageSrc = "qrc:/res/baseline-error_outline-24px.svg"
+        ColumnLayout {
+            Label {
+                text: qsTr("Select host video encoder GPU for '%1':").arg(hostAdapterDialog.pcName)
+                font.bold: true
             }
 
-            // Stop showing the spinner and show the image instead
-            showSpinner = false
+            RadioButton {
+                text: qsTr("Automatic (Host default)")
+                checked: hostAdapterDialog.selectedAdapterId === ""
+                onClicked: hostAdapterDialog.selectedAdapterId = ""
+            }
+
+            Repeater {
+                model: hostAdapterDialog.adapters
+                RadioButton {
+                    text: modelData.isDefault ? qsTr("%1 (Host Default)").arg(modelData.name) : modelData.name
+                    checked: hostAdapterDialog.selectedAdapterId === modelData.id
+                    onClicked: hostAdapterDialog.selectedAdapterId = modelData.id
+                }
+            }
+        }
+    }
+
+    NavigableDialog {
+        id: hostCaptureAdapterDialog
+        property int pcIndex: -1
+        property string pcName: ""
+        property var adapters: []
+        property string selectedAdapterId: ""
+
+        standardButtons: Dialog.Ok | Dialog.Cancel
+
+        onAccepted: {
+            if (pcIndex >= 0) {
+                computerModel.setHostCaptureAdapter(pcIndex, selectedAdapterId)
+            }
+        }
+
+        ColumnLayout {
+            Label {
+                text: qsTr("Select host X11 / capture render GPU for '%1':").arg(hostCaptureAdapterDialog.pcName)
+                font.bold: true
+            }
+
+            Label {
+                Layout.maximumWidth: 460
+                wrapMode: Text.WordWrap
+                font.pointSize: Math.max(8, Qt.application.font.pointSize - 1)
+                text: qsTr("Controls KMS capture card and per-session app offload (DRI_PRIME / Vulkan) independently of the video encoder GPU. Shared X11 compositing stays on the host's (Active X11) GPU.")
+            }
+
+            RadioButton {
+                text: qsTr("Automatic (Host current X11)")
+                checked: hostCaptureAdapterDialog.selectedAdapterId === ""
+                onClicked: hostCaptureAdapterDialog.selectedAdapterId = ""
+            }
+
+            Repeater {
+                model: hostCaptureAdapterDialog.adapters
+                RadioButton {
+                    text: modelData.isCaptureDefault ? qsTr("%1 (Active X11)").arg(modelData.name) : modelData.name
+                    checked: hostCaptureAdapterDialog.selectedAdapterId === modelData.id
+                    onClicked: hostCaptureAdapterDialog.selectedAdapterId = modelData.id
+                }
+            }
         }
     }
 

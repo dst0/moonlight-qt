@@ -1,11 +1,11 @@
 #include "nvcomputer.h"
 #include "nvapp.h"
-#include "settings/compatfetcher.h"
+#include "lanpolicy.h"
 
 #include <QUdpSocket>
-#include <QHostInfo>
 #include <QNetworkInterface>
 #include <QNetworkProxy>
+#include <QXmlStreamReader>
 
 #define SER_NAME "hostname"
 #define SER_UUID "uuid"
@@ -23,20 +23,52 @@
 #define SER_CUSTOMNAME "customname"
 #define SER_NVIDIASOFTWARE "nvidiasw"
 
+bool NvComputer::isValidUuid(const QString& uuid)
+{
+    if (uuid.isEmpty() || uuid.size() > 64) {
+        return false;
+    }
+    for (const QChar c : uuid) {
+        const ushort u = c.unicode();
+        const bool ok = (u >= '0' && u <= '9') ||
+                        (u >= 'A' && u <= 'Z') ||
+                        (u >= 'a' && u <= 'z') ||
+                        u == '_' || u == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
 NvComputer::NvComputer(QSettings& settings)
 {
     this->name = settings.value(SER_NAME).toString();
-    this->uuid = settings.value(SER_UUID).toString();
+    const QString rawUuid = settings.value(SER_UUID).toString();
+    this->uuid = isValidUuid(rawUuid) ? rawUuid : QString();
     this->hasCustomName = settings.value(SER_CUSTOMNAME).toBool();
     this->macAddress = settings.value(SER_MAC).toByteArray();
     this->localAddress = NvAddress(settings.value(SER_LOCALADDR).toString(),
                                    settings.value(SER_LOCALPORT, QVariant(DEFAULT_HTTP_PORT)).toUInt());
-    this->remoteAddress = NvAddress(settings.value(SER_REMOTEADDR).toString(),
-                                    settings.value(SER_REMOTEPORT, QVariant(DEFAULT_HTTP_PORT)).toUInt());
+    if (!this->localAddress.isNull() &&
+            !LanPolicy::isPermittedConnectionTarget(QHostAddress(this->localAddress.address()))) {
+        this->localAddress = NvAddress();
+    }
+    // A WAN address persisted by older versions is dropped (and purged from settings on the
+    // next save): this client is LAN-only and never contacts it.
+    this->remoteAddress = NvAddress();
     this->ipv6Address = NvAddress(settings.value(SER_IPV6ADDR).toString(),
                                   settings.value(SER_IPV6PORT, QVariant(DEFAULT_HTTP_PORT)).toUInt());
+    if (!this->ipv6Address.isNull() &&
+            !LanPolicy::isPermittedConnectionTarget(QHostAddress(this->ipv6Address.address()))) {
+        this->ipv6Address = NvAddress();
+    }
     this->manualAddress = NvAddress(settings.value(SER_MANUALADDR).toString(),
                                     settings.value(SER_MANUALPORT, QVariant(DEFAULT_HTTP_PORT)).toUInt());
+    if (!this->manualAddress.isNull() &&
+            !LanPolicy::isPermittedConnectionTarget(QHostAddress(this->manualAddress.address()))) {
+        this->manualAddress = NvAddress();
+    }
     this->serverCert = QSslCertificate(settings.value(SER_SRVCERT).toByteArray());
     this->isNvidiaServerSoftware = settings.value(SER_NVIDIASOFTWARE).toBool();
 
@@ -137,7 +169,8 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
         this->name = "UNKNOWN";
     }
 
-    this->uuid = NvHTTP::getXmlString(serverInfo, "uniqueid");
+    const QString rawUuid = NvHTTP::getXmlString(serverInfo, "uniqueid");
+    this->uuid = isValidUuid(rawUuid) ? rawUuid : QString();
     QString newMacString = NvHTTP::getXmlString(serverInfo, "mac");
     if (newMacString != "00:00:00:00:00:00") {
         QStringList macOctets = newMacString.split(':');
@@ -172,7 +205,8 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
 
     // We can get an IPv4 loopback address if we're using the GS IPv6 Forwarder
     this->localAddress = NvAddress(NvHTTP::getXmlString(serverInfo, "LocalIP"), http.httpPort());
-    if (this->localAddress.address().startsWith("127.")) {
+    if (this->localAddress.address().startsWith("127.") ||
+            !LanPolicy::isPermittedConnectionTarget(QHostAddress(this->localAddress.address()))) {
         this->localAddress = NvAddress();
     }
 
@@ -188,13 +222,9 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
         this->externalPort = http.httpPort();
     }
 
-    QString remoteAddress = NvHTTP::getXmlString(serverInfo, "ExternalIP");
-    if (!remoteAddress.isEmpty()) {
-        this->remoteAddress = NvAddress(remoteAddress, this->externalPort);
-    }
-    else {
-        this->remoteAddress = NvAddress();
-    }
+    // The host-reported WAN address (ExternalIP) is deliberately ignored: this client is
+    // LAN-only and must never poll, stream to or send Wake-on-LAN packets to it.
+    this->remoteAddress = NvAddress();
 
     // Real Nvidia host software (GeForce Experience and RTX Experience) both use the 'Mjolnir'
     // codename in the state field and no version of Sunshine does. We can use this to bypass
@@ -210,7 +240,98 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
     this->activeAddress = http.address();
     this->state = NvComputer::CS_ONLINE;
     this->pendingQuit = false;
-    this->isSupportedServerVersion = CompatFetcher::isGfeVersionSupported(this->gfeVersion);
+    // The online GFE compatibility list is not fetched (LAN-only client); without that
+    // list every server version was already treated as supported.
+    this->isSupportedServerVersion = true;
+
+
+    // secure-desktop-stream feature discovery (DESIGN 3.1). The authoritative per-client
+    // answer comes from /sds/v1/capabilities once a stream is up.
+    this->sdsVersion = qMax(0, NvHTTP::getXmlString(serverInfo, "sdsVersion").toInt());
+    this->sdsFeatures.clear();
+    this->sdsEncoders.clear();
+    this->sdsSoftwareCodecModeSupport = 0;
+    this->sdsAdapters.clear();
+    if (this->sdsVersion > 0) {
+        const QStringList features = NvHTTP::getXmlString(serverInfo, "sdsFeatures").split(',', Qt::SkipEmptyParts);
+        for (const QString& feature : features) {
+            QString f = feature.trimmed().toLower();
+            if ((f == "clipboard" || f == "files" || f == "mic" || f == "file_clipboard" ||
+                 f == "host_encoder" || f == "host_capture_adapter" || f == "host_resolution" ||
+                 f == "lazy_clipboard" || f == "xdnd_drop" || f == "hw_ycocgr_444") &&
+                !this->sdsFeatures.contains(f)) {
+                this->sdsFeatures.append(f);
+            }
+        }
+
+        const QStringList encoders = NvHTTP::getXmlString(serverInfo, "sdsEncoders").split(',', Qt::SkipEmptyParts);
+        for (const QString& enc : encoders) {
+            QString e = enc.trimmed().toLower();
+            if (!e.isEmpty() && !this->sdsEncoders.contains(e)) {
+                this->sdsEncoders.append(e);
+            }
+        }
+
+        this->sdsSoftwareCodecModeSupport = NvHTTP::getXmlString(serverInfo, "sdsSoftwareCodecModeSupport").toInt();
+
+        QXmlStreamReader xmlReader(serverInfo);
+        bool inAdapters = false;
+        while (!xmlReader.atEnd()) {
+            QXmlStreamReader::TokenType token = xmlReader.readNext();
+            if (token == QXmlStreamReader::StartElement) {
+                if (xmlReader.name() == QStringLiteral("sdsAdapters")) {
+                    inAdapters = true;
+                }
+                else if (inAdapters && xmlReader.name() == QStringLiteral("Adapter")) {
+                    this->sdsAdapters.append(NvHostAdapter());
+                }
+                else if (inAdapters && !this->sdsAdapters.isEmpty()) {
+                    if (xmlReader.name() == QStringLiteral("ID")) {
+                        this->sdsAdapters.last().id = xmlReader.readElementText().trimmed();
+                    }
+                    else if (xmlReader.name() == QStringLiteral("Name")) {
+                        this->sdsAdapters.last().name = xmlReader.readElementText().trimmed();
+                    }
+                    else if (xmlReader.name() == QStringLiteral("PciSlot")) {
+                        this->sdsAdapters.last().pciSlot = xmlReader.readElementText().trimmed();
+                    }
+                    else if (xmlReader.name() == QStringLiteral("Default")) {
+                        this->sdsAdapters.last().isDefault = (xmlReader.readElementText().trimmed().toInt() != 0);
+                    }
+                    else if (xmlReader.name() == QStringLiteral("CaptureDefault")) {
+                        this->sdsAdapters.last().isCaptureDefault = (xmlReader.readElementText().trimmed().toInt() != 0);
+                    }
+                }
+            }
+            else if (token == QXmlStreamReader::EndElement) {
+                if (xmlReader.name() == QStringLiteral("sdsAdapters")) {
+                    inAdapters = false;
+                }
+            }
+        }
+        this->sdsAdapters.erase(std::remove_if(this->sdsAdapters.begin(), this->sdsAdapters.end(),
+                                               [](const NvHostAdapter& adapter) {
+                                                   return adapter.id.isEmpty();
+                                               }),
+                                this->sdsAdapters.end());
+    }
+
+    this->maxPackedWidth = 0;
+    this->maxPackedHeight = 0;
+    const QString maxPackedStr = NvHTTP::getXmlString(serverInfo, "sdsPacked444MaxSize").trimmed();
+    if (!maxPackedStr.isEmpty()) {
+        const int sep = maxPackedStr.indexOf('x', 0, Qt::CaseInsensitive);
+        if (sep > 0) {
+            bool okW = false;
+            bool okH = false;
+            const int w = maxPackedStr.left(sep).trimmed().toInt(&okW);
+            const int h = maxPackedStr.mid(sep + 1).trimmed().toInt(&okH);
+            if (okW && okH && w > 0 && h > 0) {
+                this->maxPackedWidth = w;
+                this->maxPackedHeight = h;
+            }
+        }
+    }
 }
 
 bool NvComputer::wake() const
@@ -301,17 +422,17 @@ bool NvComputer::wake() const
             addressList.append(literalAddress);
         }
         else {
-            QHostInfo hostInfo = QHostInfo::fromName(i.key());
-            if (hostInfo.error() != QHostInfo::NoError) {
-                qWarning() << "Error resolving" << i.key() << ":" << hostInfo.errorString();
-                continue;
-            }
-
-            addressList.append(hostInfo.addresses());
+            continue;
         }
 
         // Try all IP addresses that this string resolves to
         for (QHostAddress& address : addressList) {
+            // Only wake via private, link-local or LAN broadcast/multicast addresses
+            if (!LanPolicy::isPermittedWakeTarget(address)) {
+                qInfo().noquote() << "Not sending WoL packet to non-LAN address" << address.toString();
+                continue;
+            }
+
             QUdpSocket sock;
 
             // Send to all static ports
@@ -373,6 +494,9 @@ NvComputer::ReachabilityType NvComputer::getActiveAddressReachability() const
 
     QTcpSocket s;
     s.setProxy(QNetworkProxy::NoProxy);
+    if (!LanPolicy::isPermittedConnectionTarget(QHostAddress(copyOfActiveAddress.address()))) {
+        return ReachabilityType::RI_UNKNOWN;
+    }
     s.connectToHost(copyOfActiveAddress.address(), copyOfActiveAddress.port());
     if (s.waitForConnected(3000)) {
         Q_ASSERT(!s.localAddress().isNull());
@@ -490,13 +614,14 @@ QVector<NvAddress> NvComputer::uniqueAddresses() const
     // Start with addresses correctly ordered
     uniqueAddressList.append(activeAddress);
     uniqueAddressList.append(localAddress);
-    uniqueAddressList.append(remoteAddress);
+    // remoteAddress (a WAN address learned by older versions) is never contacted
     uniqueAddressList.append(ipv6Address);
     uniqueAddressList.append(manualAddress);
 
     // Prune duplicates (always giving precedence to the first)
     for (int i = 0; i < uniqueAddressList.count(); i++) {
-        if (uniqueAddressList[i].isNull()) {
+        if (uniqueAddressList[i].isNull() ||
+                !LanPolicy::isPermittedConnectionTarget(QHostAddress(uniqueAddressList[i].address()))) {
             uniqueAddressList.remove(i);
             i--;
             continue;
@@ -510,9 +635,6 @@ QVector<NvAddress> NvComputer::uniqueAddresses() const
         }
     }
 
-    // We must have at least 1 address
-    Q_ASSERT(!uniqueAddressList.isEmpty());
-
     return uniqueAddressList;
 }
 
@@ -525,7 +647,13 @@ bool NvComputer::update(const NvComputer& that)
     QReadLocker thatLock(&that.lock);
 
     // UUID may not change or we're talking to a new PC
-    Q_ASSERT(this->uuid == that.uuid);
+    if (!isValidUuid(this->uuid)) {
+        this->uuid.clear();
+        return false;
+    }
+    if (!isValidUuid(that.uuid) || this->uuid != that.uuid) {
+        return false;
+    }
 
 #define ASSIGN_IF_CHANGED(field)       \
     if (this->field != that.field) {   \
@@ -569,6 +697,13 @@ bool NvComputer::update(const NvComputer& that)
     ASSIGN_IF_CHANGED(isNvidiaServerSoftware);
     ASSIGN_IF_CHANGED(maxLumaPixelsHEVC);
     ASSIGN_IF_CHANGED(gpuModel);
+    ASSIGN_IF_CHANGED(sdsVersion);
+    ASSIGN_IF_CHANGED(sdsFeatures);
+    ASSIGN_IF_CHANGED(sdsEncoders);
+    ASSIGN_IF_CHANGED(sdsSoftwareCodecModeSupport);
+    ASSIGN_IF_CHANGED(sdsAdapters);
+    ASSIGN_IF_CHANGED(maxPackedWidth);
+    ASSIGN_IF_CHANGED(maxPackedHeight);
     ASSIGN_IF_CHANGED_AND_NONNULL(serverCert);
     ASSIGN_IF_CHANGED_AND_NONEMPTY(displayModes);
 

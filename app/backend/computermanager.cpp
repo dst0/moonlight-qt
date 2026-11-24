@@ -1,11 +1,13 @@
 #include "computermanager.h"
 #include "boxartmanager.h"
+#include "lanpolicy.h"
 #include "nvhttp.h"
 #include "nvpairingmanager.h"
 
 #include <Limelight.h>
 #include <QtEndian>
 
+#include <QCryptographicHash>
 #include <QThread>
 #include <QThreadPool>
 #include <QCoreApplication>
@@ -31,7 +33,18 @@ public:
 private:
     bool tryPollComputer(QNetworkAccessManager* nam, NvAddress address, bool& changed)
     {
-        NvHTTP http(address, 0, m_Computer->serverCert, !m_Computer->isNvidiaServerSoftware, nam);
+        uint16_t httpsPort = 0;
+        QSslCertificate serverCert;
+        bool useTrueUid = false;
+        {
+            QReadLocker lock(&m_Computer->lock);
+            serverCert = m_Computer->serverCert;
+            useTrueUid = !m_Computer->isNvidiaServerSoftware;
+            if (!serverCert.isNull()) {
+                httpsPort = m_Computer->activeHttpsPort ? m_Computer->activeHttpsPort : DEFAULT_HTTPS_PORT;
+            }
+        }
+        NvHTTP http(address, httpsPort, serverCert, useTrueUid, nam);
 
         QString serverInfo;
         try {
@@ -43,7 +56,7 @@ private:
         NvComputer newState(http, serverInfo);
 
         // Ensure the machine that responded is the one we intended to contact
-        if (m_Computer->uuid != newState.uuid) {
+        if (!NvComputer::isValidUuid(newState.uuid) || m_Computer->uuid != newState.uuid) {
             qInfo() << "Found unexpected PC" << newState.name << "looking for" << m_Computer->name;
             return false;
         }
@@ -162,7 +175,6 @@ ComputerManager::ComputerManager(StreamingPreferences* prefs)
     : m_Prefs(prefs),
       m_PollingRef(0),
       m_MdnsBrowser(nullptr),
-      m_CompatFetcher(nullptr),
       m_NeedsDelayedFlush(false)
 {
     QSettings settings;
@@ -180,13 +192,15 @@ ComputerManager::ComputerManager(StreamingPreferences* prefs)
     for (int i = 0; i < hosts; i++) {
         settings.setArrayIndex(i);
         NvComputer* computer = new NvComputer(settings);
+        if (!NvComputer::isValidUuid(computer->uuid)) {
+            qWarning() << "Ignoring persisted host with invalid UUID";
+            delete computer;
+            continue;
+        }
         m_KnownHosts[computer->uuid] = computer;
         m_LastSerializedHosts[computer->uuid] = *computer;
     }
     settings.endArray();
-
-    // Fetch latest compatibility data asynchronously
-    m_CompatFetcher.start();
 
     // Start the delayed flush thread to handle saveHosts() calls
     m_DelayedFlushThread = new DelayedFlushThread(this);
@@ -326,40 +340,22 @@ void ComputerManager::saveHosts()
     m_DelayedFlushCondition.wakeOne();
 }
 
-QHostAddress ComputerManager::getBestGlobalAddressV6(QVector<QHostAddress> &addresses)
+QHostAddress ComputerManager::getBestLanAddressV6(QVector<QHostAddress> &addresses)
 {
+    QHostAddress fallbackLinkLocal;
     for (const QHostAddress& address : addresses) {
-        if (address.protocol() == QAbstractSocket::IPv6Protocol) {
-            if (address.isInSubnet(QHostAddress("fe80::"), 10)) {
-                // Link-local
-                continue;
+        if (address.protocol() == QAbstractSocket::IPv6Protocol &&
+                LanPolicy::isPermittedConnectionTarget(address)) {
+            if (address.isInSubnet(QHostAddress(QStringLiteral("fc00::")), 7)) {
+                return address;
             }
-
-            if (address.isInSubnet(QHostAddress("fec0::"), 10)) {
-                qInfo() << "Ignoring site-local address:" << address;
-                continue;
+            if (fallbackLinkLocal.isNull()) {
+                fallbackLinkLocal = address;
             }
-
-            if (address.isInSubnet(QHostAddress("fc00::"), 7)) {
-                qInfo() << "Ignoring ULA:" << address;
-                continue;
-            }
-
-            if (address.isInSubnet(QHostAddress("2002::"), 16)) {
-                qInfo() << "Ignoring 6to4 address:" << address;
-                continue;
-            }
-
-            if (address.isInSubnet(QHostAddress("2001::"), 32)) {
-                qInfo() << "Ignoring Teredo address:" << address;
-                continue;
-            }
-
-            return address;
         }
     }
 
-    return QHostAddress();
+    return fallbackLinkLocal;
 }
 
 void ComputerManager::startPolling()
@@ -424,38 +420,28 @@ void ComputerManager::startPollingComputer(NvComputer* computer)
 void ComputerManager::handleMdnsServiceResolved(MdnsPendingComputer* computer,
                                                 QVector<QHostAddress>& addresses)
 {
-    QHostAddress v6Global = getBestGlobalAddressV6(addresses);
+    QHostAddress v6Lan = getBestLanAddressV6(addresses);
+    NvAddress v6Address = v6Lan.isNull() ? NvAddress() : NvAddress(v6Lan, computer->port());
     bool added = false;
 
-    // Add the host using the IPv4 address
+    // Add the host using a permitted LAN IPv4 address
     for (const QHostAddress& address : std::as_const(addresses)) {
-        if (address.protocol() == QAbstractSocket::IPv4Protocol) {
-            // NB: We don't just call addNewHost() here with v6Global because the IPv6
-            // address may not be reachable (if the user hasn't installed the IPv6 helper yet
-            // or if this host lacks outbound IPv6 capability). We want to add IPv6 even if
-            // it's not currently reachable.
+        if (address.protocol() == QAbstractSocket::IPv4Protocol &&
+                LanPolicy::isPermittedConnectionTarget(address)) {
             addNewHost(NvAddress(address, computer->port()),
                        true, computer->hostname(),
-                       NvAddress(v6Global, computer->port()));
+                       v6Address);
             added = true;
             break;
         }
     }
 
     if (!added) {
-        // If we get here, there wasn't an IPv4 address so we'll do it v6-only
-        for (const QHostAddress& address : std::as_const(addresses)) {
-            if (address.protocol() == QAbstractSocket::IPv6Protocol) {
-                // Use a link-local or site-local address for the "local address"
-                if (address.isInSubnet(QHostAddress("fe80::"), 10) ||
-                        address.isInSubnet(QHostAddress("fec0::"), 10) ||
-                        address.isInSubnet(QHostAddress("fc00::"), 7)) {
-                    addNewHost(NvAddress(address, computer->port()),
-                               true, computer->hostname(),
-                               NvAddress(v6Global, computer->port()));
-                    break;
-                }
-            }
+        // If we get here, there wasn't a permitted IPv4 address so we'll try permitted IPv6
+        if (!v6Lan.isNull()) {
+            addNewHost(NvAddress(v6Lan, computer->port()),
+                       true, computer->hostname(),
+                       v6Address);
         }
     }
 
@@ -543,6 +529,30 @@ private:
 
 void ComputerManager::deleteHost(NvComputer* computer)
 {
+    if (m_Prefs != nullptr && computer != nullptr) {
+        QByteArray deletedFingerprint;
+        {
+            QReadLocker lock(&computer->lock);
+            if (!computer->serverCert.isNull()) {
+                deletedFingerprint = computer->serverCert.digest(QCryptographicHash::Sha256).toHex();
+            }
+        }
+        if (!deletedFingerprint.isEmpty()) {
+            const QString fp = QString::fromLatin1(deletedFingerprint);
+            auto removeFingerprint = [prefs = m_Prefs, fp]() {
+                if (prefs->fileClipboardHosts.removeAll(fp) > 0) {
+                    prefs->save();
+                }
+            };
+            if (QThread::currentThread() == m_Prefs->thread()) {
+                removeFingerprint();
+            }
+            else {
+                QMetaObject::invokeMethod(m_Prefs, removeFingerprint, Qt::BlockingQueuedConnection);
+            }
+        }
+    }
+
     // Punt to a worker thread to avoid stalling the
     // UI while waiting for the polling thread to die
     QThreadPool::globalInstance()->start(new DeferredHostDeletionTask(this, computer));
@@ -809,19 +819,8 @@ private:
             return serverInfo;
         } catch (...) {
             if (!m_Mdns) {
-                unsigned int portTestResult;
-
-                if (m_ComputerManager->m_Prefs->detectNetworkBlocking) {
-                    // We failed to connect to the specified PC. Let's test to make sure this network
-                    // isn't blocking Moonlight, so we can tell the user about it.
-                    portTestResult = LiTestClientConnectivity("qt.conntest.moonlight-stream.org", 443,
-                                                              ML_PORT_FLAG_TCP_47984 | ML_PORT_FLAG_TCP_47989);
-                }
-                else {
-                    portTestResult = 0;
-                }
-
-                emit computerAddCompleted(false, portTestResult != 0 && portTestResult != ML_TEST_RESULT_INCONCLUSIVE);
+                // No Internet port test is performed (LAN-only client)
+                emit computerAddCompleted(false, false);
             }
             return QString();
         }
@@ -829,8 +828,18 @@ private:
 
     void run()
     {
+        const bool primaryPermitted = LanPolicy::isPermittedConnectionTarget(QHostAddress(m_Address.address()));
+        const bool v6Permitted = !m_MdnsIpv6Address.isNull() &&
+                LanPolicy::isPermittedConnectionTarget(QHostAddress(m_MdnsIpv6Address.address()));
+        if (!primaryPermitted && !v6Permitted) {
+            if (!m_Mdns) {
+                emit computerAddCompleted(false, false);
+            }
+            return;
+        }
+
         // Use the placeholder UID for the initial poll, then we'll switch to the real one if it's not GFE
-        NvHTTP http(m_Address, 0, QSslCertificate(), false);
+        NvHTTP http(primaryPermitted ? m_Address : m_MdnsIpv6Address, 0, QSslCertificate(), false);
 
         if (m_Mdns) {
             if (m_MdnsIpv6Address.isNull()) {
@@ -847,8 +856,8 @@ private:
 
         // Perform initial serverinfo fetch over HTTP since we don't know which cert to use
         QString serverInfo = fetchServerInfo(http);
-        if (serverInfo.isEmpty() && !m_MdnsIpv6Address.isNull()) {
-            // Retry using the global IPv6 address if the IPv4 or link-local IPv6 address fails
+        if (serverInfo.isEmpty() && primaryPermitted && v6Permitted) {
+            // Retry using the LAN IPv6 address if the primary address fails
             http.setAddress(m_MdnsIpv6Address);
             serverInfo = fetchServerInfo(http);
         }
@@ -858,28 +867,54 @@ private:
 
         // Create initial newComputer using HTTP serverinfo with no pinned cert
         NvComputer* newComputer = new NvComputer(http, serverInfo);
+        if (!NvComputer::isValidUuid(newComputer->uuid)) {
+            qWarning() << "Rejecting host with invalid UUID";
+            delete newComputer;
+            if (!m_Mdns) {
+                emit computerAddCompleted(false, false);
+            }
+            return;
+        }
         http.setTrueUid(!newComputer->isNvidiaServerSoftware);
 
         // Check if we have a record of this host UUID to pull the pinned cert
         NvComputer* existingComputer;
+        QSslCertificate existingCert;
+        uint16_t existingHttpsPort = 0;
         {
             QReadLocker lock(&m_ComputerManager->m_Lock);
             existingComputer = m_ComputerManager->m_KnownHosts.value(newComputer->uuid);
             if (existingComputer != nullptr) {
-                http.setServerCert(existingComputer->serverCert);
+                QReadLocker computerLock(&existingComputer->lock);
+                existingCert = existingComputer->serverCert;
+                if (!existingCert.isNull()) {
+                    existingHttpsPort = existingComputer->activeHttpsPort ?
+                                existingComputer->activeHttpsPort :
+                                (http.httpsPort() ? http.httpsPort() : DEFAULT_HTTPS_PORT);
+                }
             }
         }
 
         // Fetch serverinfo again over HTTPS with the pinned cert
-        if (existingComputer != nullptr) {
-            Q_ASSERT(http.httpsPort() != 0);
+        if (existingComputer != nullptr && !existingCert.isNull()) {
+            http.setServerCert(existingCert);
+            http.setHttpsPort(existingHttpsPort);
             serverInfo = fetchServerInfo(http);
             if (serverInfo.isEmpty()) {
+                delete newComputer;
                 return;
             }
 
             // Update the polled computer with the HTTPS information
             NvComputer httpsComputer(http, serverInfo);
+            if (!NvComputer::isValidUuid(httpsComputer.uuid) ||
+                    newComputer->uuid != httpsComputer.uuid) {
+                delete newComputer;
+                if (!m_Mdns) {
+                    emit computerAddCompleted(false, false);
+                }
+                return;
+            }
             newComputer->update(httpsComputer);
         }
 
@@ -888,36 +923,18 @@ private:
             // Only update local address if we actually reached the PC via this address.
             // If we reached it via the IPv6 address after the local address failed,
             // don't store the non-working local address.
-            if (http.address() == m_Address) {
+            if (http.address() == m_Address && primaryPermitted) {
                 newComputer->localAddress = m_Address;
             }
 
-            // Get the WAN IP address using STUN if we're on mDNS over IPv4
-            if (QHostAddress(newComputer->localAddress.address()).protocol() == QAbstractSocket::IPv4Protocol) {
-                quint32 addr;
-                int err = LiFindExternalAddressIP4("stun.moonlight-stream.org", 3478, &addr);
-                if (err == 0) {
-                    newComputer->setRemoteAddress(QHostAddress(qFromBigEndian(addr)));
-                }
-                else {
-                    qWarning() << "STUN failed to get WAN address:" << err;
-                }
-            }
-
-            if (!m_MdnsIpv6Address.isNull()) {
+            if (v6Permitted) {
                 Q_ASSERT(QHostAddress(m_MdnsIpv6Address.address()).protocol() == QAbstractSocket::IPv6Protocol);
                 newComputer->ipv6Address = m_MdnsIpv6Address;
             }
         }
-        else {
+        else if (primaryPermitted) {
             newComputer->manualAddress = m_Address;
         }
-
-        QHostAddress hostAddress(m_Address.address());
-        bool addressIsSiteLocalV4 =
-                hostAddress.isInSubnet(QHostAddress("10.0.0.0"), 8) ||
-                hostAddress.isInSubnet(QHostAddress("172.16.0.0"), 12) ||
-                hostAddress.isInSubnet(QHostAddress("192.168.0.0"), 16);
 
         {
             // Check if this PC already exists using opportunistic read lock
@@ -966,19 +983,6 @@ private:
 
                 // Drop the lock before notifying
                 m_ComputerManager->m_Lock.unlock();
-
-                // If this wasn't added via mDNS but it is a RFC 1918 IPv4 address and not a VPN,
-                // go ahead and do the STUN request now to populate an external address.
-                if (!m_Mdns && addressIsSiteLocalV4 && newComputer->getActiveAddressReachability() != NvComputer::RI_VPN) {
-                    quint32 addr;
-                    int err = LiFindExternalAddressIP4("stun.moonlight-stream.org", 3478, &addr);
-                    if (err == 0) {
-                        newComputer->setRemoteAddress(QHostAddress(qFromBigEndian(addr)));
-                    }
-                    else {
-                        qWarning() << "STUN failed to get WAN address:" << err;
-                    }
-                }
 
                 // For non-mDNS clients, let them know it succeeded
                 if (!m_Mdns) {

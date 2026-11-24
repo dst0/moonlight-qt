@@ -38,6 +38,8 @@ unix:if(!macx|disable-prebuilts) {
 }
 
 COMMON_C_DIR = $$PWD/moonlight-common-c
+# secure-desktop-stream: SimpleStun.c (STUN) and ConnectionTester.c (Internet port test)
+# are deliberately not compiled; the client must never contact servers outside the LAN.
 ENET_DIR = $$COMMON_C_DIR/enet
 SOURCES += \
     $$ENET_DIR/callbacks.c \
@@ -55,7 +57,6 @@ SOURCES += \
     $$COMMON_C_DIR/src/AudioStream.c \
     $$COMMON_C_DIR/src/ByteBuffer.c \
     $$COMMON_C_DIR/src/Connection.c \
-    $$COMMON_C_DIR/src/ConnectionTester.c \
     $$COMMON_C_DIR/src/ControlStream.c \
     $$COMMON_C_DIR/src/FakeCallbacks.c \
     $$COMMON_C_DIR/src/InputStream.c \
@@ -64,12 +65,14 @@ SOURCES += \
     $$COMMON_C_DIR/src/Platform.c \
     $$COMMON_C_DIR/src/PlatformCrypto.c \
     $$COMMON_C_DIR/src/PlatformSockets.c \
+    $$COMMON_C_DIR/src/PortFlags.c \
     $$COMMON_C_DIR/src/RtpAudioQueue.c \
     $$COMMON_C_DIR/src/RtpVideoQueue.c \
     $$COMMON_C_DIR/src/RtspConnection.c \
     $$COMMON_C_DIR/src/RtspParser.c \
     $$COMMON_C_DIR/src/SdpGenerator.c \
-    $$COMMON_C_DIR/src/SimpleStun.c \
+    $$COMMON_C_DIR/src/SdsMicPacket.c \
+    $$COMMON_C_DIR/src/SdsMicStream.c \
     $$COMMON_C_DIR/src/VideoDepacketizer.c \
     $$COMMON_C_DIR/src/VideoStream.c
 HEADERS += \

@@ -1,7 +1,11 @@
 #include "session.h"
+#include "backend/lanpolicy.h"
+#include "backend/sdslaunchparams.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
-#include "backend/richpresencemanager.h"
+#include "streaming/sds/sdssession.h"
+#include "streaming/sds/sdstypes.h"
+#include "streaming/audio/micsession.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -9,6 +13,10 @@
 
 #ifdef HAVE_FFMPEG
 #include "video/ffmpeg.h"
+#endif
+
+#ifdef Q_OS_DARWIN
+#include "video/ffmpeg-renderers/vt.h"
 #endif
 
 #ifdef HAVE_SLVIDEO
@@ -29,6 +37,7 @@
 #define SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED 104
 #define SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS 105
 
+#include <openssl/crypto.h>
 #include <openssl/rand.h>
 
 #include <QtEndian>
@@ -44,8 +53,6 @@
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include <QQuickOpenGLUtils>
 #endif
-
-#define CONN_TEST_SERVER "qt.conntest.moonlight-stream.org"
 
 CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
     Session::clStageStarting,
@@ -76,9 +83,8 @@ void Session::clStageStarting(int stage)
 
 void Session::clStageFailed(int stage, int errorCode)
 {
-    // Perform the port test now, while we're on the async connection thread and not blocking the UI.
+    // No Internet port test is performed (LAN-only client), so m_PortTestResults stays 0.
     unsigned int portFlags = LiGetPortFlagsFromStage(stage);
-    s_ActiveSession->m_PortTestResults = LiTestClientConnectivity(CONN_TEST_SERVER, 443, portFlags);
 
     char failingPorts[128];
     LiStringifyPortFlags(portFlags, ", ", failingPorts, sizeof(failingPorts));
@@ -88,7 +94,6 @@ void Session::clStageFailed(int stage, int errorCode)
 void Session::clConnectionTerminated(int errorCode)
 {
     unsigned int portFlags = LiGetPortFlagsFromTerminationErrorCode(errorCode);
-    s_ActiveSession->m_PortTestResults = LiTestClientConnectivity(CONN_TEST_SERVER, 443, portFlags);
 
     // Display the termination dialog if this was not intended
     switch (errorCode) {
@@ -278,9 +283,10 @@ void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlag
 bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             StreamingPreferences::RendererSelection renderer,
                             SDL_Window* window, int videoFormat, int width, int height,
-                            int frameRate, bool enableVsync, bool enableFramePacing, bool testOnly, IVideoDecoder*& chosenDecoder)
+                            int frameRate, bool enableVsync, bool enableFramePacing, bool testOnly, IVideoDecoder*& chosenDecoder,
+                            int packedYCoCgRMode, int logicalWidth, int logicalHeight)
 {
-    DECODER_PARAMETERS params;
+    DECODER_PARAMETERS params{};
 
     // We should never have vsync enabled for test-mode.
     // It introduces unnecessary delay for renderers that may
@@ -297,6 +303,9 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.testOnly = testOnly;
     params.vds = vds;
     params.renderer = renderer;
+    params.packedYCoCgRMode = packedYCoCgRMode;
+    params.logicalWidth = logicalWidth;
+    params.logicalHeight = logicalHeight;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "V-sync %s",
@@ -491,14 +500,19 @@ void Session::getDecoderInfo(SDL_Window* window,
 Session::DecoderAvailability
 Session::getDecoderAvailability(SDL_Window* window,
                                 StreamingPreferences::VideoDecoderSelection vds,
-                                int videoFormat, int width, int height, int frameRate)
+                                int videoFormat, int width, int height, int frameRate,
+                                StreamingPreferences::RendererSelection renderer,
+                                int packedYCoCgRMode,
+                                int logicalWidth,
+                                int logicalHeight)
 {
     IVideoDecoder* decoder;
 
     if (!chooseDecoder(vds,
-                       StreamingPreferences::RS_PROBE_ONLY,
+                       renderer,
                        window, videoFormat, width, height, frameRate,
-                       false, false, true, decoder)) {
+                       false, false, true, decoder,
+                       packedYCoCgRMode, logicalWidth, logicalHeight)) {
         return DecoderAvailability::None;
     }
 
@@ -513,6 +527,9 @@ bool Session::populateDecoderProperties(SDL_Window* window)
 {
     IVideoDecoder* decoder;
 
+    const int probeW = m_UsePackedYCoCgRA1 ? m_Packed444Layout.encW : m_StreamConfig.width;
+    const int probeH = m_UsePackedYCoCgRA1 ? m_Packed444Layout.encH : m_StreamConfig.height;
+
     // NB: We pass the real renderer selection rather than RS_PROBE_ONLY
     // here because this is operating on the real streaming window, and
     // instantiating Metal or AVSBDL renderers can interfere with MoltenVK's
@@ -521,10 +538,13 @@ bool Session::populateDecoderProperties(SDL_Window* window)
                        m_Preferences->rendererSelection,
                        window,
                        m_SupportedVideoFormats.first(),
-                       m_StreamConfig.width,
-                       m_StreamConfig.height,
+                       probeW,
+                       probeH,
                        m_StreamConfig.fps,
-                       false, false, true, decoder)) {
+                       false, false, true, decoder,
+                       m_UsePackedYCoCgRA1 ? 1 : 0,
+                       m_StreamConfig.width,
+                       m_StreamConfig.height)) {
         return false;
     }
 
@@ -567,6 +587,7 @@ bool Session::populateDecoderProperties(SDL_Window* window)
 Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *preferences)
     : m_Preferences(preferences ? preferences : StreamingPreferences::get()),
       m_IsFullScreen(m_Preferences->windowMode != StreamingPreferences::WM_WINDOWED || !WMUtils::isRunningDesktopEnvironment()),
+      m_StreamConfig{},
       m_Computer(computer),
       m_App(app),
       m_Window(nullptr),
@@ -581,10 +602,18 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_ShouldExit(false),
       m_AsyncConnectionSuccess(false),
       m_PortTestResults(0),
+      m_ActiveVideoFormat(0),
+      m_ActiveVideoWidth(0),
+      m_ActiveVideoHeight(0),
+      m_ActiveVideoFrameRate(0),
+      m_Packed444Decision{},
+      m_Packed444Layout{},
+      m_UsePackedYCoCgRA1(false),
       m_OpusDecoder(nullptr),
       m_AudioRenderer(nullptr),
       m_AudioSampleCount(0),
-      m_DropAudioEndTime(0)
+      m_DropAudioEndTime(0),
+      m_Mic(nullptr)
 {
 }
 
@@ -592,8 +621,15 @@ Session::~Session()
 {
     // NB: This may not get destroyed for a long time! Don't put any non-trivial cleanup here.
     // Use Session::exec() or DeferredSessionCleanupTask instead.
+    clearStreamSecrets();
 
     SDL_DestroyMutex(m_DecoderLock);
+}
+
+void Session::clearStreamSecrets()
+{
+    OPENSSL_cleanse(m_StreamConfig.remoteInputAesKey, sizeof(m_StreamConfig.remoteInputAesKey));
+    OPENSSL_cleanse(m_StreamConfig.remoteInputAesIv, sizeof(m_StreamConfig.remoteInputAesIv));
 }
 
 bool Session::initialize(QQuickWindow* qtWindow)
@@ -680,19 +716,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
 
     m_StreamConfig.fps = m_Preferences->fps;
     m_StreamConfig.bitrate = m_Preferences->bitrateKbps;
-
-#ifndef STEAM_LINK
-    // Opt-in to all encryption features if we detect that the platform
-    // has AES cryptography acceleration instructions and more than 2 cores.
-    if (StreamUtils::hasFastAes() && SDL_GetCPUCount() > 2) {
-        m_StreamConfig.encryptionFlags = ENCFLG_ALL;
-    }
-    else {
-        // Enable audio encryption as long as we're not on Steam Link.
-        // That hardware can hardly handle Opus decoding at all.
-        m_StreamConfig.encryptionFlags = ENCFLG_AUDIO;
-    }
-#endif
+    m_StreamConfig.encryptionFlags = ENCFLG_ALL;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Video bitrate: %d kbps",
@@ -703,6 +727,12 @@ bool Session::initialize(QQuickWindow* qtWindow)
 
     // Only the first 4 bytes are populated in the RI key IV
     RAND_bytes(reinterpret_cast<unsigned char*>(m_StreamConfig.remoteInputAesIv), 4);
+
+    // secure-desktop-stream: request the microphone stream only when the user enabled it and
+    // macOS access is not denied. moonlight-common-c sets it up only if the host offers it.
+    m_StreamConfig.enableMicrophone = m_Preferences->micPassthrough &&
+                                      (MicPermission::status() == MicPermission::Status::Authorized ||
+                                       MicPermission::status() == MicPermission::Status::NotDetermined);
 
     switch (m_Preferences->audioConfig)
     {
@@ -730,166 +760,302 @@ bool Session::initialize(QQuickWindow* qtWindow)
                 "Audio channel mask: %X",
                 CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(m_StreamConfig.audioConfiguration));
 
-    // Start with all codecs and profiles in priority order
-    m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_HIGH10_444);
-    m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_MAIN10);
-    m_SupportedVideoFormats.append(VIDEO_FORMAT_H265_REXT10_444);
-    m_SupportedVideoFormats.append(VIDEO_FORMAT_H265_MAIN10);
-    m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_HIGH8_444);
-    m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_MAIN8);
-    m_SupportedVideoFormats.append(VIDEO_FORMAT_H265_REXT8_444);
-    m_SupportedVideoFormats.append(VIDEO_FORMAT_H265);
-    m_SupportedVideoFormats.append(VIDEO_FORMAT_H264_HIGH8_444);
-    m_SupportedVideoFormats.append(VIDEO_FORMAT_H264);
-
-    switch (m_Preferences->videoCodecConfig)
+    // Evaluate hardware packed YCoCg-R P010 4:4:4 eligibility
+    m_UsePackedYCoCgRA1 = false;
+    m_Packed444Layout = {};
+    m_Packed444Decision = {};
     {
-    case StreamingPreferences::VCC_AUTO:
-    {
-        // Codecs are checked in order of ascending decode complexity to ensure
-        // the the deprioritized list prefers lighter codecs for software decoding
-
-        // H.264 is already the lowest priority codec, so we don't need to do
-        // any probing for deprioritization for it here.
-
-        auto hevcDA = getDecoderAvailability(testWindow,
-                                             m_Preferences->videoDecoderSelection,
-                                             m_Preferences->enableYUV444 ?
-                                                 (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_REXT10_444 : VIDEO_FORMAT_H265_REXT8_444) :
-                                                 (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_MAIN10 : VIDEO_FORMAT_H265),
-                                             m_StreamConfig.width,
-                                             m_StreamConfig.height,
-                                             m_StreamConfig.fps);
-        if (hevcDA == DecoderAvailability::None && m_Preferences->enableHdr) {
-            // Remove all 10-bit HEVC profiles
-            m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_H265 & VIDEO_FORMAT_MASK_10BIT);
-
-            // Check if we have 10-bit AV1 support
-            auto av1DA = getDecoderAvailability(testWindow,
-                                                m_Preferences->videoDecoderSelection,
-                                                m_Preferences->enableYUV444 ? VIDEO_FORMAT_AV1_HIGH10_444 : VIDEO_FORMAT_AV1_MAIN10,
-                                                m_StreamConfig.width,
-                                                m_StreamConfig.height,
-                                                m_StreamConfig.fps);
-            if (av1DA == DecoderAvailability::None) {
-                // Remove all 10-bit AV1 profiles
-                m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_AV1 & VIDEO_FORMAT_MASK_10BIT);
-
-                // There are no available 10-bit profiles, so reprobe for 8-bit HEVC
-                // and we'll proceed as normal for an SDR streaming scenario.
-                SDL_assert(!(m_SupportedVideoFormats & VIDEO_FORMAT_MASK_10BIT));
-                hevcDA = getDecoderAvailability(testWindow,
-                                                m_Preferences->videoDecoderSelection,
-                                                m_Preferences->enableYUV444 ? VIDEO_FORMAT_H265_REXT8_444 : VIDEO_FORMAT_H265,
-                                                m_StreamConfig.width,
-                                                m_StreamConfig.height,
-                                                m_StreamConfig.fps);
-            }
+        bool isNvidiaServerSoftware = false;
+        bool hasHostEncoder = false;
+        int serverCodecModeSupport = 0;
+        int swServerCodecModeSupport = 0;
+        int maxLumaPixelsHEVC = 0;
+        int sdsVersion = 0;
+        QStringList sdsFeatures;
+        int maxPackedWidth = 0;
+        int maxPackedHeight = 0;
+        QString gpuModel;
+        {
+            QReadLocker lock(&m_Computer->lock);
+            isNvidiaServerSoftware = m_Computer->isNvidiaServerSoftware;
+            hasHostEncoder = !isNvidiaServerSoftware && m_Computer->hasSdsFeature(QStringLiteral("host_encoder"));
+            serverCodecModeSupport = m_Computer->serverCodecModeSupport;
+            swServerCodecModeSupport = m_Computer->sdsSoftwareCodecModeSupport;
+            maxLumaPixelsHEVC = m_Computer->maxLumaPixelsHEVC;
+            sdsVersion = m_Computer->sdsVersion;
+            sdsFeatures = m_Computer->sdsFeatures;
+            maxPackedWidth = m_Computer->maxPackedWidth;
+            maxPackedHeight = m_Computer->maxPackedHeight;
+            gpuModel = m_Computer->gpuModel;
         }
 
-        if (hevcDA != DecoderAvailability::Hardware) {
-            // Deprioritize HEVC unless the user forced software decoding and enabled HDR.
-            // We need HEVC in that case because we cannot support 10-bit content with H.264,
-            // which would ordinarily be prioritized for software decoding performance.
-            if (m_Preferences->videoDecoderSelection != StreamingPreferences::VDS_FORCE_SOFTWARE || !m_Preferences->enableHdr) {
-                m_SupportedVideoFormats.deprioritizeByMask(VIDEO_FORMAT_MASK_H265);
-            }
-        }
+        const int effectiveCodecModes = SdsLaunch::effectiveServerCodecModeSupport(
+                    isNvidiaServerSoftware,
+                    hasHostEncoder,
+                    serverCodecModeSupport,
+                    swServerCodecModeSupport,
+                    m_Preferences->hostEncoderConfig);
 
-        // Deprioritize AV1 unless we can't hardware decode HEVC, and have HDR enabled
-        // or we're on Windows or a non-x86 Linux/BSD.
-        //
-        // Normally, we'd assume hardware that can't decode HEVC definitely can't decode
-        // AV1 either, and we wouldn't even bother probing for AV1 support. However, some
-        // Windows business systems have HEVC support disabled in firmware from the factory,
-        // yet they can still decode AV1 in hardware. To avoid falling back to H.264 on
-        // these systems, we don't deprioritize AV1. This firmware-based HEVC licensing
-        // behavior seems to be unique to Windows, and Linux on the same system is able
-        // to decode HEVC in hardware normally using VAAPI.
-        // https://www.reddit.com/r/GeForceNOW/comments/1omsckt/psa_be_wary_of_purchasing_dell_computers_with/
-        //
-        // Some embedded Linux platforms have incomplete V4L2 decoding support which can
-        // lead to unusual cases where a system might support H.264 and AV1 but not HEVC,
-        // even if the underlying hardware supports all three. RK3588 is an example of
-        // such a SoC. To handle this situation, we will also probe for AV1 if we're on
-        // a non-x86 non-macOS UNIX system.
-        //
-        // We want to keep AV1 at the top of the list for HDR with software decoding
-        // because dav1d is higher performance than FFmpeg's HEVC software decoder.
-        if (hevcDA == DecoderAvailability::Hardware
-#if !defined(Q_OS_WIN32) && (!(defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN)) || defined(Q_PROCESSOR_X86))
-            || !m_Preferences->enableHdr
+        Packed444Inputs packedInputs;
+        packedInputs.enableYUV444 = m_Preferences->enableYUV444;
+        packedInputs.enableHdr = m_Preferences->enableHdr;
+        packedInputs.videoCodecConfig = m_Preferences->videoCodecConfig;
+        packedInputs.videoDecoderSelection = m_Preferences->videoDecoderSelection;
+        packedInputs.rendererSelection = m_Preferences->rendererSelection;
+        packedInputs.hostEncoderConfig = hasHostEncoder ? m_Preferences->hostEncoderConfig : StreamingPreferences::HEC_AUTO;
+        packedInputs.hostEncoderIsSoftware =
+                (hasHostEncoder && m_Preferences->hostEncoderConfig == StreamingPreferences::HEC_SOFTWARE) ||
+                gpuModel.contains(QStringLiteral("software"), Qt::CaseInsensitive);
+        packedInputs.hostSupportsHwYCoCgR444 = (sdsVersion > 0) && sdsFeatures.contains(QStringLiteral("hw_ycocgr_444"));
+        packedInputs.hostNativeYuv444Supported = (effectiveCodecModes & SCM_MASK_YUV444) != 0;
+        packedInputs.maxPackedW = (maxPackedWidth > 0) ? maxPackedWidth : 8192;
+        packedInputs.maxPackedH = (maxPackedHeight > 0) ? maxPackedHeight : 4352;
+        packedInputs.logicalW = m_StreamConfig.width;
+        packedInputs.logicalH = m_StreamConfig.height;
+#ifdef Q_OS_DARWIN
+        packedInputs.isMacOSMetalAvailable = VTMetalRendererFactory::isMetalAvailable();
+#else
+        packedInputs.isMacOSMetalAvailable = false;
 #endif
-            ) {
-            m_SupportedVideoFormats.deprioritizeByMask(VIDEO_FORMAT_MASK_AV1);
+
+        m_Packed444Decision = resolvePacked444Decision(packedInputs);
+        if (!m_Packed444Decision.userWarning.isEmpty()) {
+            emitLaunchWarning(m_Packed444Decision.userWarning);
         }
-        else if (!m_Preferences->enableHdr &&
-                   getDecoderAvailability(testWindow,
-                                          m_Preferences->videoDecoderSelection,
-                                          m_Preferences->enableYUV444 ? VIDEO_FORMAT_AV1_HIGH8_444 : VIDEO_FORMAT_AV1_MAIN8,
-                                          m_StreamConfig.width,
-                                          m_StreamConfig.height,
-                                          m_StreamConfig.fps) != DecoderAvailability::Hardware) {
-            m_SupportedVideoFormats.deprioritizeByMask(VIDEO_FORMAT_MASK_AV1);
+
+        if (m_Packed444Decision.usePackedYCoCgRA1) {
+            m_Packed444Layout = computePackedYCoCgRA1Layout(m_StreamConfig.width,
+                                                            m_StreamConfig.height,
+                                                            packedInputs.maxPackedW,
+                                                            packedInputs.maxPackedH);
+            if (!(serverCodecModeSupport & SCM_HEVC_MAIN10) || maxLumaPixelsHEVC == 0) {
+                m_Packed444Decision.usePackedYCoCgRA1 = false;
+                m_Packed444Decision.forceHevcMain10 = false;
+                m_Packed444Decision.keep444Bitrate = false;
+                m_Packed444Decision.fallbackReason = QStringLiteral("host_no_hevc_main10");
+                emitLaunchWarning(tr("Your host PC doesn't support 10-bit HEVC encoding required for hardware packed 4:4:4."));
+            }
+            else {
+                auto packedDA = getDecoderAvailability(testWindow,
+                                                       m_Preferences->videoDecoderSelection,
+                                                       VIDEO_FORMAT_H265_MAIN10,
+                                                       m_Packed444Layout.encW,
+                                                       m_Packed444Layout.encH,
+                                                       m_StreamConfig.fps,
+                                                       m_Preferences->rendererSelection,
+                                                       1,
+                                                       m_StreamConfig.width,
+                                                       m_StreamConfig.height);
+                if (packedDA == DecoderAvailability::None &&
+                    m_Preferences->videoDecoderSelection != StreamingPreferences::VDS_FORCE_HARDWARE) {
+                    m_Packed444Decision.usePackedYCoCgRA1 = false;
+                    m_Packed444Decision.forceHevcMain10 = false;
+                    m_Packed444Decision.keep444Bitrate = false;
+                    m_Packed444Decision.fallbackReason = QStringLiteral("client_no_hevc_main10_metal");
+                    emitLaunchWarning(tr("This PC lacks 10-bit HEVC Metal decoding required for hardware packed 4:4:4."));
+                }
+                else {
+                    m_UsePackedYCoCgRA1 = true;
+                    if (packedDA == DecoderAvailability::Software &&
+                        m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_AUTO) {
+                        emitLaunchWarning(tr("Using software decoding for hardware packed 4:4:4 due to missing 10-bit HEVC GPU support. This may cause poor streaming performance."));
+                    }
+                }
+            }
         }
+    }
+
+    if (m_UsePackedYCoCgRA1) {
+        // Negotiate 10-bit HEVC 4:2:0 Main10 (without YUV444 mask) while keeping 4:4:4 bitrate
+        m_SupportedVideoFormats.clear();
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_H265_MAIN10);
+    }
+    else {
+        // Start with all codecs and profiles in priority order
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_HIGH10_444);
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_MAIN10);
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_H265_REXT10_444);
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_H265_MAIN10);
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_HIGH8_444);
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_MAIN8);
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_H265_REXT8_444);
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_H265);
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_H264_HIGH8_444);
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_H264);
+
+        switch (m_Preferences->videoCodecConfig)
+        {
+        case StreamingPreferences::VCC_AUTO:
+        {
+            // Codecs are checked in order of ascending decode complexity to ensure
+            // the the deprioritized list prefers lighter codecs for software decoding
+
+            // H.264 is already the lowest priority codec, so we don't need to do
+            // any probing for deprioritization for it here.
+
+            auto hevcDA = getDecoderAvailability(testWindow,
+                                                 m_Preferences->videoDecoderSelection,
+                                                 m_Preferences->enableYUV444 ?
+                                                     (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_REXT10_444 : VIDEO_FORMAT_H265_REXT8_444) :
+                                                     (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_MAIN10 : VIDEO_FORMAT_H265),
+                                                 m_StreamConfig.width,
+                                                 m_StreamConfig.height,
+                                                 m_StreamConfig.fps);
+            if (hevcDA == DecoderAvailability::None && m_Preferences->enableHdr) {
+                // Remove all 10-bit HEVC profiles
+                m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_H265 & VIDEO_FORMAT_MASK_10BIT);
+
+                // Check if we have 10-bit AV1 support
+                auto av1DA = getDecoderAvailability(testWindow,
+                                                    m_Preferences->videoDecoderSelection,
+                                                    m_Preferences->enableYUV444 ? VIDEO_FORMAT_AV1_HIGH10_444 : VIDEO_FORMAT_AV1_MAIN10,
+                                                    m_StreamConfig.width,
+                                                    m_StreamConfig.height,
+                                                    m_StreamConfig.fps);
+                if (av1DA == DecoderAvailability::None) {
+                    // Remove all 10-bit AV1 profiles
+                    m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_AV1 & VIDEO_FORMAT_MASK_10BIT);
+
+                    // There are no available 10-bit profiles, so reprobe for 8-bit HEVC
+                    // and we'll proceed as normal for an SDR streaming scenario.
+                    SDL_assert(!(m_SupportedVideoFormats & VIDEO_FORMAT_MASK_10BIT));
+                    hevcDA = getDecoderAvailability(testWindow,
+                                                    m_Preferences->videoDecoderSelection,
+                                                    m_Preferences->enableYUV444 ? VIDEO_FORMAT_H265_REXT8_444 : VIDEO_FORMAT_H265,
+                                                    m_StreamConfig.width,
+                                                    m_StreamConfig.height,
+                                                    m_StreamConfig.fps);
+                }
+            }
+
+            if (hevcDA != DecoderAvailability::Hardware) {
+                // Deprioritize HEVC unless the user forced software decoding and enabled HDR.
+                // We need HEVC in that case because we cannot support 10-bit content with H.264,
+                // which would ordinarily be prioritized for software decoding performance.
+                if (m_Preferences->videoDecoderSelection != StreamingPreferences::VDS_FORCE_SOFTWARE || !m_Preferences->enableHdr) {
+                    m_SupportedVideoFormats.deprioritizeByMask(VIDEO_FORMAT_MASK_H265);
+                }
+            }
+
+            // Deprioritize AV1 unless we can't hardware decode HEVC, and have HDR enabled
+            // or we're on Windows or a non-x86 Linux/BSD.
+            //
+            // Normally, we'd assume hardware that can't decode HEVC definitely can't decode
+            // AV1 either, and we wouldn't even bother probing for AV1 support. However, some
+            // Windows business systems have HEVC support disabled in firmware from the factory,
+            // yet they can still decode AV1 in hardware. To avoid falling back to H.264 on
+            // these systems, we don't deprioritize AV1. This firmware-based HEVC licensing
+            // behavior seems to be unique to Windows, and Linux on the same system is able
+            // to decode HEVC in hardware normally using VAAPI.
+            // https://www.reddit.com/r/GeForceNOW/comments/1omsckt/psa_be_wary_of_purchasing_dell_computers_with/
+            //
+            // Some embedded Linux platforms have incomplete V4L2 decoding support which can
+            // lead to unusual cases where a system might support H.264 and AV1 but not HEVC,
+            // even if the underlying hardware supports all three. RK3588 is an example of
+            // such a SoC. To handle this situation, we will also probe for AV1 if we're on
+            // a non-x86 non-macOS UNIX system.
+            //
+            // We want to keep AV1 at the top of the list for HDR with software decoding
+            // because dav1d is higher performance than FFmpeg's HEVC software decoder.
+            if (hevcDA == DecoderAvailability::Hardware
+#if !defined(Q_OS_WIN32) && (!(defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN)) || defined(Q_PROCESSOR_X86))
+                || !m_Preferences->enableHdr
+#endif
+                ) {
+                m_SupportedVideoFormats.deprioritizeByMask(VIDEO_FORMAT_MASK_AV1);
+            }
+            else if (!m_Preferences->enableHdr &&
+                       getDecoderAvailability(testWindow,
+                                              m_Preferences->videoDecoderSelection,
+                                              m_Preferences->enableYUV444 ? VIDEO_FORMAT_AV1_HIGH8_444 : VIDEO_FORMAT_AV1_MAIN8,
+                                              m_StreamConfig.width,
+                                              m_StreamConfig.height,
+                                              m_StreamConfig.fps) != DecoderAvailability::Hardware) {
+                m_SupportedVideoFormats.deprioritizeByMask(VIDEO_FORMAT_MASK_AV1);
+            }
 
 #ifdef Q_OS_DARWIN
-        {
-            // Prior to GFE 3.11, GFE did not allow us to constrain
-            // the number of reference frames, so we have to fixup the SPS
-            // to allow decoding via VideoToolbox on macOS. Since we don't
-            // have fixup code for HEVC, just avoid it if GFE is too old.
-            QVector<int> gfeVersion = NvHTTP::parseQuad(m_Computer->gfeVersion);
-            if (gfeVersion.value(0) < 3 ||
-                (gfeVersion.value(0) == 3 && gfeVersion.value(1) < 11)) {
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Disabling HEVC on macOS due to old GFE version");
-                m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_H265);
+            {
+                // Prior to GFE 3.11, GFE did not allow us to constrain
+                // the number of reference frames, so we have to fixup the SPS
+                // to allow decoding via VideoToolbox on macOS. Since we don't
+                // have fixup code for HEVC, just avoid it if GFE is too old.
+                QVector<int> gfeVersion = NvHTTP::parseQuad(m_Computer->gfeVersion);
+                if (gfeVersion.value(0) < 3 ||
+                    (gfeVersion.value(0) == 3 && gfeVersion.value(1) < 11)) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                "Disabling HEVC on macOS due to old GFE version");
+                    m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_H265);
+                }
             }
-        }
 #endif
-        break;
-    }
-    case StreamingPreferences::VCC_FORCE_H264:
-        m_SupportedVideoFormats.removeByMask(~VIDEO_FORMAT_MASK_H264);
-        break;
-    case StreamingPreferences::VCC_FORCE_HEVC:
-    case StreamingPreferences::VCC_FORCE_HEVC_HDR_DEPRECATED:
-        m_SupportedVideoFormats.removeByMask(~VIDEO_FORMAT_MASK_H265);
-        break;
-    case StreamingPreferences::VCC_FORCE_AV1:
-        // We'll try to fall back to HEVC first if AV1 fails. We'd rather not fall back
-        // straight to H.264 if the user asked for AV1 and the host doesn't support it.
-        m_SupportedVideoFormats.removeByMask(~(VIDEO_FORMAT_MASK_AV1 | VIDEO_FORMAT_MASK_H265));
-        break;
+            break;
+        }
+        case StreamingPreferences::VCC_FORCE_H264:
+            m_SupportedVideoFormats.removeByMask(~VIDEO_FORMAT_MASK_H264);
+            break;
+        case StreamingPreferences::VCC_FORCE_HEVC:
+        case StreamingPreferences::VCC_FORCE_HEVC_HDR_DEPRECATED:
+            m_SupportedVideoFormats.removeByMask(~VIDEO_FORMAT_MASK_H265);
+            break;
+        case StreamingPreferences::VCC_FORCE_AV1:
+            // We'll try to fall back to HEVC first if AV1 fails. We'd rather not fall back
+            // straight to H.264 if the user asked for AV1 and the host doesn't support it.
+            m_SupportedVideoFormats.removeByMask(~(VIDEO_FORMAT_MASK_AV1 | VIDEO_FORMAT_MASK_H265));
+            break;
+        }
+
+        // NB: Since deprioritization puts codecs in reverse order (at the bottom of the list),
+        // we want to deprioritize for the most critical attributes last to ensure they are the
+        // lowest priority codecs during server negotiation. Here we do that with YUV 4:4:4 and
+        // HDR to ensure we never pick a codec profile that doesn't meet the user's requirement
+        // if we can avoid it.
+
+        // Mask off YUV 4:4:4 codecs if the option is not enabled
+        if (!m_Preferences->enableYUV444) {
+            m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_YUV444);
+        }
+        else {
+            // Deprioritize YUV 4:2:0 codecs if the user wants YUV 4:4:4
+            //
+            // NB: Since this happens first before deprioritizing HDR, we will
+            // pick a YUV 4:4:4 profile instead of a 10-bit profile if they
+            // aren't both available together for any codec.
+            m_SupportedVideoFormats.deprioritizeByMask(~VIDEO_FORMAT_MASK_YUV444);
+        }
+
+        // Mask off 10-bit codecs if HDR is not enabled
+        if (!m_Preferences->enableHdr) {
+            m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_10BIT);
+        }
+        else {
+            // Deprioritize 8-bit codecs if HDR is enabled
+            m_SupportedVideoFormats.deprioritizeByMask(~VIDEO_FORMAT_MASK_10BIT);
+        }
     }
 
-    // NB: Since deprioritization puts codecs in reverse order (at the bottom of the list),
-    // we want to deprioritize for the most critical attributes last to ensure they are the
-    // lowest priority codecs during server negotiation. Here we do that with YUV 4:4:4 and
-    // HDR to ensure we never pick a codec profile that doesn't meet the user's requirement
-    // if we can avoid it.
-
-    // Mask off YUV 4:4:4 codecs if the option is not enabled
-    if (!m_Preferences->enableYUV444) {
-        m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_YUV444);
-    }
-    else {
-        // Deprioritize YUV 4:2:0 codecs if the user wants YUV 4:4:4
-        //
-        // NB: Since this happens first before deprioritizing HDR, we will
-        // pick a YUV 4:4:4 profile instead of a 10-bit profile if they
-        // aren't both available together for any codec.
-        m_SupportedVideoFormats.deprioritizeByMask(~VIDEO_FORMAT_MASK_YUV444);
-    }
-
-    // Mask off 10-bit codecs if HDR is not enabled
-    if (!m_Preferences->enableHdr) {
-        m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_10BIT);
-    }
-    else {
-        // Deprioritize 8-bit codecs if HDR is enabled
-        m_SupportedVideoFormats.deprioritizeByMask(~VIDEO_FORMAT_MASK_10BIT);
+    {
+        QReadLocker lock(&m_Computer->lock);
+        bool hasHostEncoder = !m_Computer->isNvidiaServerSoftware &&
+                              m_Computer->hasSdsFeature(QStringLiteral("host_encoder"));
+        int effectiveCodecModes = SdsLaunch::effectiveServerCodecModeSupport(
+                    m_Computer->isNvidiaServerSoftware,
+                    hasHostEncoder,
+                    m_Computer->serverCodecModeSupport,
+                    m_Computer->sdsSoftwareCodecModeSupport,
+                    m_Preferences->hostEncoderConfig);
+        if (!m_UsePackedYCoCgRA1 &&
+            SdsLaunch::shouldPreferSoftwareH264Yuv444(
+                    m_Computer->isNvidiaServerSoftware,
+                    hasHostEncoder,
+                    m_Preferences->hostEncoderConfig,
+                    m_Preferences->videoCodecConfig,
+                    m_Preferences->enableYUV444,
+                    effectiveCodecModes) &&
+                m_SupportedVideoFormats.contains(VIDEO_FORMAT_H264_HIGH8_444)) {
+            m_SupportedVideoFormats.removeAll(VIDEO_FORMAT_H264_HIGH8_444);
+            m_SupportedVideoFormats.prepend(VIDEO_FORMAT_H264_HIGH8_444);
+        }
     }
 
     switch (m_Preferences->windowMode)
@@ -970,8 +1136,41 @@ void Session::emitLaunchWarning(QString text)
 
 bool Session::validateLaunch(SDL_Window* testWindow)
 {
-    if (!m_Computer->isSupportedServerVersion) {
-        emit displayLaunchError(tr("The version of GeForce Experience on %1 is not supported by this build of Moonlight. You must update Moonlight to stream from %1.").arg(m_Computer->name));
+    bool isNvidiaServerSoftware = false;
+    bool isSupportedServerVersion = false;
+    bool hasHostEncoder = false;
+    int rawServerCodecModeSupport = 0;
+    int swServerCodecModeSupport = 0;
+    int maxLumaPixelsHEVC = 0;
+    QString computerName;
+    QString gfeVersion;
+    {
+        QReadLocker lock(&m_Computer->lock);
+        isNvidiaServerSoftware = m_Computer->isNvidiaServerSoftware;
+        isSupportedServerVersion = m_Computer->isSupportedServerVersion;
+        hasHostEncoder = !isNvidiaServerSoftware && m_Computer->hasSdsFeature(QStringLiteral("host_encoder"));
+        rawServerCodecModeSupport = m_Computer->serverCodecModeSupport;
+        swServerCodecModeSupport = m_Computer->sdsSoftwareCodecModeSupport;
+        maxLumaPixelsHEVC = m_Computer->maxLumaPixelsHEVC;
+        computerName = m_Computer->name;
+        gfeVersion = m_Computer->gfeVersion;
+    }
+
+    const int effectiveCodecModeSupport = SdsLaunch::effectiveServerCodecModeSupport(
+                isNvidiaServerSoftware,
+                hasHostEncoder,
+                rawServerCodecModeSupport,
+                swServerCodecModeSupport,
+                m_Preferences->hostEncoderConfig);
+    const bool hostHevcSupported = SdsLaunch::isHostHevcSupported(
+                isNvidiaServerSoftware,
+                hasHostEncoder,
+                maxLumaPixelsHEVC,
+                effectiveCodecModeSupport,
+                m_Preferences->hostEncoderConfig);
+
+    if (!isSupportedServerVersion) {
+        emit displayLaunchError(tr("The version of GeForce Experience on %1 is not supported by this build of Moonlight. You must update Moonlight to stream from %1.").arg(computerName));
         return false;
     }
 
@@ -984,7 +1183,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
     }
 
     if (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_AV1) {
-        if (m_SupportedVideoFormats.maskByServerCodecModes(m_Computer->serverCodecModeSupport & SCM_MASK_AV1) == 0) {
+        if (m_SupportedVideoFormats.maskByServerCodecModes(effectiveCodecModeSupport & SCM_MASK_AV1) == 0) {
             if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_AV1) {
                 emitLaunchWarning(tr("Your host software or GPU doesn't support encoding AV1."));
             }
@@ -1014,7 +1213,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
     }
 
     if (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_H265) {
-        if (m_Computer->maxLumaPixelsHEVC == 0) {
+        if (!hostHevcSupported) {
             if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_HEVC) {
                 emitLaunchWarning(tr("Your host PC doesn't support encoding HEVC."));
             }
@@ -1026,6 +1225,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         }
         else {
             if (!m_Preferences->enableHdr && // HDR is checked below
+                 !m_UsePackedYCoCgRA1 && // Packed 4:4:4 already probed Main10 above
                  m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_AUTO && // Force hardware decoding checked below
                  m_Preferences->videoCodecConfig != StreamingPreferences::VCC_AUTO && // Auto VCC is already checked in initialize()
                  getDecoderAvailability(testWindow,
@@ -1056,7 +1256,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
             emitLaunchWarning(tr("Using software decoding due to your selection to force H.264 without GPU support. This may cause poor streaming performance."));
         }
         else {
-            if (m_Computer->maxLumaPixelsHEVC == 0 &&
+            if (!hostHevcSupported &&
                     getDecoderAvailability(testWindow,
                                            m_Preferences->videoDecoderSelection,
                                            VIDEO_FORMAT_H265,
@@ -1080,7 +1280,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
             emitLaunchWarning(tr("This PC's GPU doesn't support 10-bit HEVC or AV1 decoding for HDR streaming."));
         }
         // Check that the server GPU supports HDR
-        else if (m_SupportedVideoFormats.maskByServerCodecModes(m_Computer->serverCodecModeSupport & SCM_MASK_10BIT) == 0) {
+        else if (m_SupportedVideoFormats.maskByServerCodecModes(effectiveCodecModeSupport & SCM_MASK_10BIT) == 0) {
             emitLaunchWarning(tr("Your host PC doesn't support HDR streaming."));
             m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_10BIT);
         }
@@ -1088,7 +1288,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
             bool displayedHdrSoftwareDecodeWarning = false;
 
             // Check that the available HDR-capable codecs on the client and server are compatible
-            if (m_SupportedVideoFormats.maskByServerCodecModes(m_Computer->serverCodecModeSupport & SCM_AV1_MAIN10)) {
+            if (m_SupportedVideoFormats.maskByServerCodecModes(effectiveCodecModeSupport & SCM_AV1_MAIN10)) {
                 auto da = getDecoderAvailability(testWindow,
                                                  m_Preferences->videoDecoderSelection,
                                                  VIDEO_FORMAT_AV1_MAIN10,
@@ -1106,7 +1306,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
                     displayedHdrSoftwareDecodeWarning = true;
                 }
             }
-            if (m_SupportedVideoFormats.maskByServerCodecModes(m_Computer->serverCodecModeSupport & SCM_HEVC_MAIN10)) {
+            if (m_SupportedVideoFormats.maskByServerCodecModes(effectiveCodecModeSupport & SCM_HEVC_MAIN10)) {
                 auto da = getDecoderAvailability(testWindow,
                                                  m_Preferences->videoDecoderSelection,
                                                  VIDEO_FORMAT_H265_MAIN10,
@@ -1128,19 +1328,21 @@ bool Session::validateLaunch(SDL_Window* testWindow)
 
         // Check for compatibility between server and client codecs
         if ((m_SupportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) && // Ignore this check if we already failed one above
-            !(m_SupportedVideoFormats.maskByServerCodecModes(m_Computer->serverCodecModeSupport) & VIDEO_FORMAT_MASK_10BIT)) {
+            !(m_SupportedVideoFormats.maskByServerCodecModes(effectiveCodecModeSupport) & VIDEO_FORMAT_MASK_10BIT)) {
             emitLaunchWarning(tr("Your host PC and client PC don't support the same HDR video codecs."));
             m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_10BIT);
         }
     }
 
-    if (m_Preferences->enableYUV444) {
-        if (!(m_Computer->serverCodecModeSupport & SCM_MASK_YUV444)) {
-            emitLaunchWarning(tr("Your host PC doesn't support YUV 4:4:4 streaming."));
+    if (m_Preferences->enableYUV444 && !m_UsePackedYCoCgRA1) {
+        if (!(effectiveCodecModeSupport & SCM_MASK_YUV444)) {
+            if (m_Packed444Decision.userWarning.isEmpty()) {
+                emitLaunchWarning(tr("Your host PC doesn't support YUV 4:4:4 streaming."));
+            }
             m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_YUV444);
         }
         else {
-            m_SupportedVideoFormats.removeByMask(~m_SupportedVideoFormats.maskByServerCodecModes(m_Computer->serverCodecModeSupport));
+            m_SupportedVideoFormats.removeByMask(~m_SupportedVideoFormats.maskByServerCodecModes(effectiveCodecModeSupport));
 
             if (!m_SupportedVideoFormats.isEmpty() &&
                 !(m_SupportedVideoFormats.front() & VIDEO_FORMAT_MASK_YUV444)) {
@@ -1173,7 +1375,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
 
     if (m_StreamConfig.width >= 3840) {
         // Only allow 4K on GFE 3.x+
-        if (m_Computer->gfeVersion.isEmpty() || m_Computer->gfeVersion.startsWith("2.")) {
+        if (gfeVersion.isEmpty() || gfeVersion.startsWith("2.")) {
             emitLaunchWarning(tr("GeForce Experience 3.0 or higher is required for 4K streaming."));
 
             m_StreamConfig.width = 1920;
@@ -1214,10 +1416,10 @@ bool Session::validateLaunch(SDL_Window* testWindow)
     //
     // However, if we aren't using Nvidia hosting software, don't assume anything about
     // encoding capabilities by using HEVC Main 10 support. It will likely be wrong.
-    if ((m_StreamConfig.width > 4096 || m_StreamConfig.height > 4096) && m_Computer->isNvidiaServerSoftware) {
+    if ((m_StreamConfig.width > 4096 || m_StreamConfig.height > 4096) && isNvidiaServerSoftware) {
         // Pascal added support for 8K HEVC encoding support. Maxwell 2 could encode HEVC but only up to 4K.
         // We can't directly identify Pascal, but we can look for HEVC Main10 which was added in the same generation.
-        if (m_Computer->maxLumaPixelsHEVC == 0 || !(m_Computer->serverCodecModeSupport & SCM_HEVC_MAIN10)) {
+        if (!hostHevcSupported || !(effectiveCodecModeSupport & SCM_HEVC_MAIN10)) {
             emit displayLaunchError(tr("Your host PC's GPU doesn't support streaming video resolutions over 4K."));
             return false;
         }
@@ -1228,13 +1430,17 @@ bool Session::validateLaunch(SDL_Window* testWindow)
     }
 
     if (m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_FORCE_HARDWARE &&
-            !(m_SupportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) && // HDR was already checked for hardware decode support above
+            (!(m_SupportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) || m_UsePackedYCoCgRA1) && // HDR was already checked for hardware decode support above
             getDecoderAvailability(testWindow,
                                    m_Preferences->videoDecoderSelection,
                                    m_SupportedVideoFormats.front(),
+                                   m_UsePackedYCoCgRA1 ? m_Packed444Layout.encW : m_StreamConfig.width,
+                                   m_UsePackedYCoCgRA1 ? m_Packed444Layout.encH : m_StreamConfig.height,
+                                   m_StreamConfig.fps,
+                                   m_UsePackedYCoCgRA1 ? m_Preferences->rendererSelection : StreamingPreferences::RS_PROBE_ONLY,
+                                   m_UsePackedYCoCgRA1 ? 1 : 0,
                                    m_StreamConfig.width,
-                                   m_StreamConfig.height,
-                                   m_StreamConfig.fps) != DecoderAvailability::Hardware) {
+                                   m_StreamConfig.height) != DecoderAvailability::Hardware) {
         if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_AUTO) {
             emit displayLaunchError(tr("Your selection to force hardware decoding cannot be satisfied due to missing hardware decoding support on this PC's GPU."));
         }
@@ -1289,6 +1495,7 @@ private:
 
         // Finish cleanup of the connection state
         LiStopConnection();
+        m_Session->clearStreamSecrets();
 
         // Perform a best-effort app quit
         if (shouldQuit) {
@@ -1596,18 +1803,48 @@ public:
 // Called in a non-main thread
 bool Session::startConnectionAsync()
 {
+    int currentGameId = 0;
+    bool isNvidiaServerSoftware = false;
+    bool hasHostEncoder = false;
+    bool hasHostCaptureAdapter = false;
+    bool hasHostResolution = false;
+    QVector<NvDisplayMode> displayModes;
+    QVector<NvHostAdapter> sdsAdapters;
+    NvAddress activeAddress;
+    uint16_t activeHttpsPort = 0;
+    QSslCertificate serverCert;
+    {
+        QReadLocker lock(&m_Computer->lock);
+        currentGameId = m_Computer->currentGameId;
+        isNvidiaServerSoftware = m_Computer->isNvidiaServerSoftware;
+        hasHostEncoder = !isNvidiaServerSoftware && m_Computer->hasSdsFeature(QStringLiteral("host_encoder"));
+        hasHostCaptureAdapter = !isNvidiaServerSoftware && m_Computer->hasSdsFeature(QStringLiteral("host_capture_adapter"));
+        hasHostResolution = !isNvidiaServerSoftware && m_Computer->hasSdsFeature(QStringLiteral("host_resolution"));
+        displayModes = m_Computer->displayModes;
+        sdsAdapters = m_Computer->sdsAdapters;
+        activeAddress = m_Computer->activeAddress;
+        activeHttpsPort = m_Computer->activeHttpsPort;
+        serverCert = m_Computer->serverCert;
+    }
+
     // The UI should have ensured the old game was already quit
     // if we decide to stream a different game.
-    Q_ASSERT(m_Computer->currentGameId == 0 ||
-             m_Computer->currentGameId == m_App.id);
+    Q_ASSERT(currentGameId == 0 ||
+             currentGameId == m_App.id);
+
+    if (!LanPolicy::isPermittedConnectionTarget(QHostAddress(activeAddress.address()))) {
+        clearStreamSecrets();
+        emit displayLaunchError(tr("Use a private LAN IP address or an SSH loopback tunnel"));
+        return false;
+    }
 
     bool enableGameOptimizations;
-    if (m_Computer->isNvidiaServerSoftware) {
+    if (isNvidiaServerSoftware) {
         // GFE will set all settings to 720p60 if it doesn't recognize
         // the chosen resolution. Avoid that by disabling SOPS when it
         // is not streaming a supported resolution.
         enableGameOptimizations = false;
-        for (const NvDisplayMode &mode : std::as_const(m_Computer->displayModes)) {
+        for (const NvDisplayMode &mode : std::as_const(displayModes)) {
             if (mode.width == m_StreamConfig.width &&
                     mode.height == m_StreamConfig.height) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -1624,38 +1861,85 @@ bool Session::startConnectionAsync()
         enableGameOptimizations = m_Preferences->gameOptimizations;
     }
 
+    const QString fingerprint = SdsLaunch::hostCertFingerprint(serverCert);
+    const QString selectedAdapterId = fingerprint.isEmpty()
+            ? QString()
+            : m_Preferences->hostAdapterOverride(fingerprint);
+    const QString selectedCaptureAdapterId = fingerprint.isEmpty()
+            ? QString()
+            : m_Preferences->hostCaptureAdapterOverride(fingerprint);
+    const bool hevcRequested = (m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_H265) != 0;
+    const QString extraQueryParams = SdsLaunch::buildLaunchExtraQueryParams(
+                isNvidiaServerSoftware,
+                hasHostEncoder,
+                hasHostResolution,
+                m_Preferences->hostEncoderConfig,
+                sdsAdapters,
+                selectedAdapterId,
+                hevcRequested,
+                m_Preferences->matchHostResolution,
+                m_Preferences->effectiveRevertHostResolution(),
+                hasHostCaptureAdapter,
+                selectedCaptureAdapterId);
+
     QString rtspSessionUrl;
 
     try {
-        NvHTTP http(m_Computer);
-        http.startApp(m_Computer->currentGameId != 0 ? "resume" : "launch",
-                      m_Computer->isNvidiaServerSoftware,
+        NvHTTP http(activeAddress, activeHttpsPort, serverCert, !isNvidiaServerSoftware);
+        http.startApp(currentGameId != 0 ? "resume" : "launch",
+                      isNvidiaServerSoftware,
                       m_App.id, &m_StreamConfig,
                       enableGameOptimizations,
                       m_Preferences->playAudioOnHost,
                       m_InputHandler->getAttachedGamepadMask(),
                       !m_Preferences->multiController,
-                      rtspSessionUrl);
+                      rtspSessionUrl,
+                      m_UsePackedYCoCgRA1 ? QStringLiteral("ycocgr_p010_a1") : QString(),
+                      extraQueryParams);
     } catch (const GfeHttpResponseException& e) {
+        clearStreamSecrets();
         emit displayLaunchError(tr("Host returned error: %1").arg(e.toQString()));
         return false;
     } catch (const QtNetworkReplyException& e) {
+        clearStreamSecrets();
         emit displayLaunchError(e.toQString());
         return false;
     }
 
-    QByteArray hostnameStr = m_Computer->activeAddress.address().toUtf8();
-    QByteArray siAppVersion = m_Computer->appVersion.toUtf8();
+    QString siAppVersionStr;
+    QString siGfeVersionStr;
+    int serverCodecModeSupport = 0;
+    {
+        QReadLocker lock(&m_Computer->lock);
+        activeAddress = m_Computer->activeAddress;
+        siAppVersionStr = m_Computer->appVersion;
+        siGfeVersionStr = m_Computer->gfeVersion;
+        serverCodecModeSupport = SdsLaunch::effectiveServerCodecModeSupport(
+                    m_Computer->isNvidiaServerSoftware,
+                    hasHostEncoder,
+                    m_Computer->serverCodecModeSupport,
+                    m_Computer->sdsSoftwareCodecModeSupport,
+                    m_Preferences->hostEncoderConfig);
+    }
+
+    if (!LanPolicy::isPermittedConnectionTarget(QHostAddress(activeAddress.address()))) {
+        clearStreamSecrets();
+        emit displayLaunchError(tr("Use a private LAN IP address or an SSH loopback tunnel"));
+        return false;
+    }
+
+    QByteArray hostnameStr = activeAddress.address().toUtf8();
+    QByteArray siAppVersion = siAppVersionStr.toUtf8();
 
     SERVER_INFORMATION hostInfo;
     hostInfo.address = hostnameStr.data();
     hostInfo.serverInfoAppVersion = siAppVersion.data();
-    hostInfo.serverCodecModeSupport = m_Computer->serverCodecModeSupport;
+    hostInfo.serverCodecModeSupport = serverCodecModeSupport;
 
     // Older GFE versions didn't have this field
     QByteArray siGfeVersion;
-    if (!m_Computer->gfeVersion.isEmpty()) {
-        siGfeVersion = m_Computer->gfeVersion.toUtf8();
+    if (!siGfeVersionStr.isEmpty()) {
+        siGfeVersion = siGfeVersionStr.toUtf8();
     }
     if (!siGfeVersion.isEmpty()) {
         hostInfo.serverInfoGfeVersion = siGfeVersion.data();
@@ -1709,6 +1993,7 @@ bool Session::startConnectionAsync()
     // If the user has adjusted the bitrate from default, we'll assume they really wanted
     // that value and not second guess them.
     if (m_Preferences->enableYUV444 &&
+        !m_Packed444Decision.keep444Bitrate &&
         !(m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_YUV444) &&
         m_StreamConfig.bitrate == StreamingPreferences::getDefaultBitrate(m_StreamConfig.width,
                                                                           m_StreamConfig.height,
@@ -1726,6 +2011,7 @@ bool Session::startConnectionAsync()
     if (err != 0) {
         // We already displayed an error dialog in the stage failure
         // listener.
+        clearStreamSecrets();
         return false;
     }
 
@@ -1968,11 +2254,26 @@ void Session::exec()
     // (m_UnexpectedTermination is set back to true).
     m_UnexpectedTermination = false;
 
-    // Start rich presence to indicate we're in game
-    RichPresenceManager presence(*m_Preferences, m_App.name);
+    // secure-desktop-stream: clipboard sync and file transfer while the stream is up
+    std::unique_ptr<SdsSession> sds = SdsSession::create(m_Computer, m_Preferences, m_OverlayManager,
+                                                         [this]() { return m_MouseEmulationRefCount > 0; });
+    m_Sds = sds.get();
 
     // Toggle the stats overlay if requested by the user
     m_OverlayManager.setOverlayState(Overlay::OverlayDebug, m_Preferences->showPerformanceOverlay);
+
+    // secure-desktop-stream: start microphone passthrough now that the connection is up
+    if (m_StreamConfig.enableMicrophone) {
+        MicSession::Dependencies micDeps = MicSession::platformDependencies();
+        micDeps.showStatus = [this](const std::string& text) {
+            if (!text.empty()) {
+                m_OverlayManager.updateOverlayText(Overlay::OverlayStatusUpdate, text.c_str());
+            }
+            m_OverlayManager.setOverlayState(Overlay::OverlayStatusUpdate, !text.empty());
+        };
+        m_Mic = new MicSession(m_Preferences->micEchoCancellation, std::move(micDeps));
+        m_Mic->begin();
+    }
 
     // Switch to async logging mode when we enter the SDL loop
     StreamUtils::enterAsyncLoggingMode();
@@ -1992,7 +2293,6 @@ void Session::exec()
         // issues that could cause indefinite timeouts, delayed joystick detection,
         // and other problems.
         if (!SDL_WaitEventTimeout(&event, 1000)) {
-            presence.runCallbacks();
             continue;
         }
 #else
@@ -2008,7 +2308,6 @@ void Session::exec()
             // ARM core in the Steam Link, so we will wait 10 ms instead.
             SDL_Delay(10);
 #endif
-            presence.runCallbacks();
             continue;
         }
 #endif
@@ -2053,9 +2352,61 @@ void Session::exec()
                 m_InputHandler->setAdaptiveTriggers((uint16_t)(uintptr_t)event.user.data1,
                                                     (DualSenseOutputReport *)event.user.data2);
                 break;
+            case SDL_CODE_SDS_TICK:
+            case SDL_CODE_SDS_WAKE:
+                if (m_Sds != nullptr) {
+                    m_Sds->handleUserEvent(event.user.code);
+                }
+                break;
+            case SDL_CODE_MIC_PERMISSION_RESULT:
+                // secure-desktop-stream: macOS microphone prompt answered
+                if (m_Mic != nullptr) {
+                    m_Mic->onPermissionResult(event.user.data1 != nullptr);
+                }
+                break;
             default:
                 SDL_assert(false);
             }
+            break;
+
+        case SDL_DROPBEGIN:
+            m_DropBatchActive = true;
+            m_PendingDropFiles.clear();
+            break;
+        case SDL_DROPFILE:
+        case SDL_DROPCOMPLETE:
+            if (event.type == SDL_DROPFILE) {
+                if (event.drop.file != nullptr) {
+                    const QString droppedPath = QString::fromUtf8(event.drop.file);
+                    if (m_DropBatchActive) {
+                        m_PendingDropFiles.append(droppedPath);
+                    }
+                    else {
+                        m_PendingDropFiles = {droppedPath};
+                    }
+                }
+                SDL_free(event.drop.file);
+                if (m_DropBatchActive) {
+                    break;
+                }
+            }
+            if (m_Sds != nullptr && !m_PendingDropFiles.isEmpty()) {
+                int winW = 0, winH = 0, winX = 0, winY = 0, globalX = 0, globalY = 0;
+                SDL_GetWindowSize(m_Window, &winW, &winH);
+                SDL_GetWindowPosition(m_Window, &winX, &winY);
+                SDL_GetGlobalMouseState(&globalX, &globalY);
+                double nx = 0.5, ny = 0.5;
+                Sds::mapPointToNormalizedVideoRect(winW, winH,
+                                                   m_ActiveVideoWidth, m_ActiveVideoHeight,
+                                                   globalX - winX, globalY - winY,
+                                                   &nx, &ny);
+                m_Sds->handleDropFiles(nx, ny, m_PendingDropFiles);
+            }
+            m_PendingDropFiles.clear();
+            m_DropBatchActive = false;
+            break;
+        case SDL_DROPTEXT:
+            SDL_free(event.drop.file);
             break;
 
         case SDL_WINDOWEVENT:
@@ -2077,8 +2428,6 @@ void Session::exec()
                 m_InputHandler->notifyMouseLeave();
                 break;
             }
-
-            presence.runCallbacks();
 
             // Capture the mouse on SDL_WINDOWEVENT_ENTER if needed
             if (needsFirstEnterCapture && event.window.event == SDL_WINDOWEVENT_ENTER) {
@@ -2227,12 +2576,17 @@ void Session::exec()
                 // not if a GPU was removed or something).
                 if (!chooseDecoder(m_Preferences->videoDecoderSelection,
                                    m_Preferences->rendererSelection,
-                                   m_Window, m_ActiveVideoFormat, m_ActiveVideoWidth,
-                                   m_ActiveVideoHeight, m_ActiveVideoFrameRate,
+                                   m_Window, m_ActiveVideoFormat,
+                                   m_UsePackedYCoCgRA1 ? m_Packed444Layout.encW : m_ActiveVideoWidth,
+                                   m_UsePackedYCoCgRA1 ? m_Packed444Layout.encH : m_ActiveVideoHeight,
+                                   m_ActiveVideoFrameRate,
                                    enableVsync,
                                    enableVsync && m_Preferences->framePacing,
                                    false,
-                                   s_ActiveSession->m_VideoDecoder)) {
+                                   s_ActiveSession->m_VideoDecoder,
+                                   m_UsePackedYCoCgRA1 ? 1 : 0,
+                                   m_ActiveVideoWidth,
+                                   m_ActiveVideoHeight)) {
                     SDL_UnlockMutex(m_DecoderLock);
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                                  "Failed to recreate decoder after reset");
@@ -2264,12 +2618,10 @@ void Session::exec()
 
         case SDL_KEYUP:
         case SDL_KEYDOWN:
-            presence.runCallbacks();
             m_InputHandler->handleKeyEvent(&event.key);
             break;
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
-            presence.runCallbacks();
             m_InputHandler->handleMouseButtonEvent(&event.button);
             break;
         case SDL_MOUSEMOTION:
@@ -2283,7 +2635,6 @@ void Session::exec()
             break;
         case SDL_CONTROLLERBUTTONDOWN:
         case SDL_CONTROLLERBUTTONUP:
-            presence.runCallbacks();
             m_InputHandler->handleControllerButtonEvent(&event.cbutton);
             break;
 #if SDL_VERSION_ATLEAST(2, 0, 14)
@@ -2325,6 +2676,16 @@ void Session::exec()
     }
 
 DispatchDeferredCleanup:
+    // secure-desktop-stream: stop the clipboard/file client before LiStopConnection()
+    m_Sds = nullptr;
+    sds.reset();
+    // secure-desktop-stream: stop capturing before LiStopConnection() in the cleanup task
+    if (m_Mic != nullptr) {
+        m_Mic->end();
+        delete m_Mic;
+        m_Mic = nullptr;
+    }
+
     // Switch back to synchronous logging mode
     StreamUtils::exitAsyncLoggingMode();
 

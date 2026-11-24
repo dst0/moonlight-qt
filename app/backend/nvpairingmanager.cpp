@@ -26,11 +26,15 @@ NvPairingManager::NvPairingManager(NvComputer* computer) :
     }
 
     QByteArray pk = IdentityManager::get()->getPrivateKey();
-    bio = BIO_new_mem_buf(pk.data(), -1);
-    THROW_BAD_ALLOC_IF_NULL(bio);
+    bio = BIO_new_mem_buf(pk.constData(), pk.size());
+    if (bio == nullptr) {
+        pk.fill('\0');
+        throw std::bad_alloc();
+    }
 
     m_PrivateKey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
     BIO_free_all(bio);
+    pk.fill('\0');
     if (m_PrivateKey == nullptr)
     {
         throw std::runtime_error("Unable to load private key");

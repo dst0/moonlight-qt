@@ -126,6 +126,9 @@ private:
     int m_StreamFps;
     int m_OriginalVideoWidth;
     int m_OriginalVideoHeight;
+    int m_PackedYCoCgRMode;
+    int m_LogicalWidth;
+    int m_LogicalHeight;
     int m_VideoFormat;
     bool m_NeedsSpsFixup;
     bool m_TestOnly;

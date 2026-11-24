@@ -8,8 +8,11 @@
 #include "settings/streamingpreferences.h"
 #include "input/input.h"
 #include "video/decoder.h"
+#include "video/packed444.h"
 #include "audio/renderers/renderer.h"
 #include "video/overlaymanager.h"
+
+class SdsSession;
 
 class SupportedVideoFormatList : public QList<int>
 {
@@ -89,6 +92,8 @@ public:
     }
 };
 
+class MicSession;
+
 class Session : public QObject
 {
     Q_OBJECT
@@ -146,6 +151,8 @@ signals:
 private:
     void exec();
 
+    void clearStreamSecrets();
+
     bool startConnectionAsync();
 
     bool validateLaunch(SDL_Window* testWindow);
@@ -180,7 +187,11 @@ private:
     static
     DecoderAvailability getDecoderAvailability(SDL_Window* window,
                                                StreamingPreferences::VideoDecoderSelection vds,
-                                               int videoFormat, int width, int height, int frameRate);
+                                               int videoFormat, int width, int height, int frameRate,
+                                               StreamingPreferences::RendererSelection renderer = StreamingPreferences::RS_PROBE_ONLY,
+                                               int packedYCoCgRMode = 0,
+                                               int logicalWidth = 0,
+                                               int logicalHeight = 0);
 
     static
     bool chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
@@ -188,7 +199,10 @@ private:
                        SDL_Window* window, int videoFormat, int width, int height,
                        int frameRate, bool enableVsync, bool enableFramePacing,
                        bool testOnly,
-                       IVideoDecoder*& chosenDecoder);
+                       IVideoDecoder*& chosenDecoder,
+                       int packedYCoCgRMode = 0,
+                       int logicalWidth = 0,
+                       int logicalHeight = 0);
 
     static
     void clStageStarting(int stage);
@@ -271,6 +285,9 @@ private:
     int m_ActiveVideoWidth;
     int m_ActiveVideoHeight;
     int m_ActiveVideoFrameRate;
+    Packed444Decision m_Packed444Decision;
+    PackedYCoCgRLayout m_Packed444Layout;
+    bool m_UsePackedYCoCgRA1;
 
     OpusMSDecoder* m_OpusDecoder;
     IAudioRenderer* m_AudioRenderer;
@@ -280,6 +297,13 @@ private:
     Uint32 m_DropAudioEndTime;
 
     Overlay::OverlayManager m_OverlayManager;
+
+    // secure-desktop-stream: clipboard and file transfer, valid only inside exec()'s SDL loop
+    SdsSession* m_Sds = nullptr;
+    bool m_DropBatchActive = false;
+    QStringList m_PendingDropFiles;
+    // secure-desktop-stream: microphone passthrough, alive between connection start and cleanup
+    MicSession* m_Mic;
 
     static CONNECTION_LISTENER_CALLBACKS k_ConnCallbacks;
     static Session* s_ActiveSession;

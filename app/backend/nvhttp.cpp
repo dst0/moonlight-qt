@@ -1,4 +1,6 @@
 #include "nvcomputer.h"
+#include "certpinning.h"
+#include "lanpolicy.h"
 #include <Limelight.h>
 
 #include <QDebug>
@@ -11,6 +13,36 @@
 #include <QImageReader>
 #include <QtEndian>
 #include <QNetworkProxy>
+#include <QRegularExpression>
+
+namespace {
+
+QString sanitizeReplyErrorString(QString errorText, const QUrl& requestUrl, const QUrl& replyUrl)
+{
+    for (const QUrl& url : {requestUrl, replyUrl}) {
+        if (!url.isValid()) {
+            continue;
+        }
+        QUrl cleanUrl(url);
+        cleanUrl.setQuery(QString());
+        const QString cleanStr = cleanUrl.toString();
+        errorText.replace(url.toString(), cleanStr);
+        errorText.replace(QString::fromUtf8(url.toEncoded()), cleanStr);
+    }
+
+    // Strip any remaining URL query component (including &rikey=... or &uniqueid=...)
+    static const QRegularExpression kQueryRe(QStringLiteral("\\?[^\\s]*"));
+    errorText.remove(kQueryRe);
+
+    static const QRegularExpression kSecretParamRe(
+        QStringLiteral("(?:&|\\b)(?:rikey|uniqueid|uuid|clientchallenge|serverchallenge|challenge_response|serverchallengeresp|clientpairingsecret|salt|signature|clientcert)=[^\\s&]*"),
+        QRegularExpression::CaseInsensitiveOption);
+    errorText.remove(kSecretParamRe);
+
+    return errorText.trimmed();
+}
+
+} // namespace
 
 #define FAST_FAIL_TIMEOUT_MS 2000
 #define REQUEST_TIMEOUT_MS 5000
@@ -135,43 +167,23 @@ NvHTTP::getServerInfo(NvLogLevel logLevel, bool fastFail)
 {
     QString serverInfo;
 
-    // Check if we have a pinned cert and HTTPS port for this host yet
-    if (!m_ServerCert.isNull() && httpsPort() != 0)
+    // If we have a pinned cert for this host, never query plaintext HTTP or fall back to HTTP.
+    if (!m_ServerCert.isNull())
     {
-        try
-        {
-            // Always try HTTPS first, since it properly reports
-            // pairing status (and a few other attributes).
-            serverInfo = openConnectionToString(m_BaseUrlHttps,
-                                                "serverinfo",
-                                                nullptr,
-                                                fastFail ? FAST_FAIL_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
-                                                logLevel);
-            // Throws if the request failed
-            verifyResponseStatus(serverInfo);
+        if (httpsPort() == 0) {
+            setHttpsPort(DEFAULT_HTTPS_PORT);
         }
-        catch (const GfeHttpResponseException& e)
-        {
-            if (e.getStatusCode() == 401)
-            {
-                // Certificate validation error, fallback to HTTP
-                serverInfo = openConnectionToString(m_BaseUrlHttp,
-                                                    "serverinfo",
-                                                    nullptr,
-                                                    fastFail ? FAST_FAIL_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
-                                                    logLevel);
-                verifyResponseStatus(serverInfo);
-            }
-            else
-            {
-                // Rethrow real errors
-                throw e;
-            }
-        }
+
+        serverInfo = openConnectionToString(m_BaseUrlHttps,
+                                            "serverinfo",
+                                            nullptr,
+                                            fastFail ? FAST_FAIL_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
+                                            logLevel);
+        verifyResponseStatus(serverInfo);
     }
     else
     {
-        // Only use HTTP prior to pairing or fetching HTTPS port
+        // Only use HTTP prior to pairing (no pinned cert yet)
         serverInfo = openConnectionToString(m_BaseUrlHttp,
                                             "serverinfo",
                                             nullptr,
@@ -180,17 +192,11 @@ NvHTTP::getServerInfo(NvLogLevel logLevel, bool fastFail)
         verifyResponseStatus(serverInfo);
 
         // Populate the HTTPS port
-        uint16_t httpsPort = getXmlString(serverInfo, "HttpsPort").toUShort();
-        if (httpsPort == 0) {
-            httpsPort = DEFAULT_HTTPS_PORT;
+        uint16_t port = getXmlString(serverInfo, "HttpsPort").toUShort();
+        if (port == 0) {
+            port = DEFAULT_HTTPS_PORT;
         }
-        setHttpsPort(httpsPort);
-
-        // If we just needed to determine the HTTPS port, we'll try again over
-        // HTTPS now that we have the port number
-        if (!m_ServerCert.isNull()) {
-            return getServerInfo(logLevel, fastFail);
-        }
+        setHttpsPort(port);
     }
 
     return serverInfo;
@@ -205,12 +211,17 @@ NvHTTP::startApp(QString verb,
                  bool localAudio,
                  int gamepadMask,
                  bool persistGameControllersOnDisconnect,
-                 QString& rtspSessionUrl)
+                 QString& rtspSessionUrl,
+                 const QString& sdsChromaMode,
+                 QString extraQueryParams)
 {
     int riKeyId;
 
     memcpy(&riKeyId, streamConfig->remoteInputAesIv, sizeof(riKeyId));
     riKeyId = qFromBigEndian(riKeyId);
+
+    const bool sendHdrMode = (streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) &&
+                             sdsChromaMode.isEmpty();
 
     QString response =
             openConnectionToString(m_BaseUrlHttps,
@@ -226,18 +237,20 @@ NvHTTP::startApp(QString verb,
                                    "&additionalStates=1&sops="+QString::number(sops ? 1 : 0)+
                                    "&rikey="+QByteArray(streamConfig->remoteInputAesKey, sizeof(streamConfig->remoteInputAesKey)).toHex()+
                                    "&rikeyid="+QString::number(riKeyId)+
-                                   ((streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) ?
+                                   (sendHdrMode ?
                                        "&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0" :
+                                        "")+
+                                   (!sdsChromaMode.isEmpty() ?
+                                       "&sdsChromaMode=" + QString::fromUtf8(QUrl::toPercentEncoding(sdsChromaMode)) :
                                         "")+
                                    "&localAudioPlayMode="+QString::number(localAudio ? 1 : 0)+
                                    "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration))+
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+
                                    "&gcmap="+QString::number(gamepadMask)+
                                    "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0)+
-                                   LiGetLaunchUrlQueryParameters(),
+                                   LiGetLaunchUrlQueryParameters()+
+                                   extraQueryParams,
                                    LAUNCH_TIMEOUT_MS);
-
-    qInfo() << "Launch response:" << response;
 
     // Throws if the request failed
     verifyResponseStatus(response);
@@ -253,8 +266,6 @@ NvHTTP::quitApp()
                                    "cancel",
                                    nullptr,
                                    QUIT_TIMEOUT_MS);
-
-    qInfo() << "Quit response:" << response;
 
     // Throws if the request failed
     verifyResponseStatus(response);
@@ -372,7 +383,7 @@ NvHTTP::verifyResponseStatus(QString xml)
                 QString statusMessage = xmlReader.attributes().value("status_message").toString();
                 if (statusCode != 401) {
                     // 401 is expected for unpaired PCs when we fetch serverinfo over HTTPS
-                    qWarning() << "Request failed:" << statusCode << statusMessage;
+                    qWarning() << "Request failed:" << statusCode;
                 }
                 if (statusCode == -1 && statusMessage == "Invalid") {
                     // Special case handling an audio capture error which GFE doesn't
@@ -432,28 +443,6 @@ NvHTTP::getXmlString(QString xml,
     return QString();
 }
 
-void NvHTTP::handleSslErrors(QNetworkReply* reply, const QList<QSslError>& errors)
-{
-    bool ignoreErrors = true;
-
-    if (m_ServerCert.isNull()) {
-        // We should never make an HTTPS request without a cert
-        Q_ASSERT(!m_ServerCert.isNull());
-        return;
-    }
-
-    for (const QSslError& error : errors) {
-        if (m_ServerCert != error.certificate()) {
-            ignoreErrors = false;
-            break;
-        }
-    }
-
-    if (ignoreErrors) {
-        reply->ignoreSslErrors(errors);
-    }
-}
-
 QString
 NvHTTP::openConnectionToString(QUrl baseUrl,
                                QString command,
@@ -488,6 +477,10 @@ NvHTTP::openConnection(QUrl baseUrl,
     // Port must be set
     Q_ASSERT(baseUrl.port(0) != 0);
 
+    if (!LanPolicy::isPermittedConnectionTarget(QHostAddress(baseUrl.host()))) {
+        throw GfeHttpResponseException(403, "Use a private LAN IP address or an SSH loopback tunnel");
+    }
+
     // Build a URL for the request
     QUrl url(baseUrl);
     url.setPath("/" + command);
@@ -498,9 +491,25 @@ NvHTTP::openConnection(QUrl baseUrl,
                  ((arguments != nullptr) ? ("&" + arguments) : ""));
 
     QNetworkRequest request(url);
+    // Redirects could leave the permitted LAN and bypass the original address check.
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
 
     // Add our client certificate
-    request.setSslConfiguration(IdentityManager::get()->getSslConfig());
+    QSslConfiguration sslConfig = IdentityManager::get()->getSslConfig();
+
+    // Every HTTPS request strictly pins the host certificate learned during pairing
+    bool pinServerCert = url.scheme() == QStringLiteral("https");
+    if (pinServerCert) {
+        if (m_ServerCert.isNull()) {
+            // We should never make an HTTPS request without a pinned cert
+            if (logLevel >= NvLogLevel::NVLL_ERROR) {
+                qWarning() << "Refusing HTTPS request without a pinned server certificate:" << command;
+            }
+            throw GfeHttpResponseException(401, "No pinned server certificate");
+        }
+        sslConfig = CertPinning::restrictToPinned(sslConfig, m_ServerCert);
+    }
+    request.setSslConfiguration(sslConfig);
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     // Disable HTTP/2 (GFE 3.22 doesn't like it) and Qt 6 enables it by default
@@ -517,8 +526,10 @@ NvHTTP::openConnection(QUrl baseUrl,
     request.setAttribute(QNetworkRequest::ConnectionCacheExpiryTimeoutSecondsAttribute, 0);
 #endif
 
-    auto sslErrorsConnection = connect(m_Nam, &QNetworkAccessManager::sslErrors, this, &NvHTTP::handleSslErrors);
     QNetworkReply* reply = m_Nam->get(request);
+    if (pinServerCert) {
+        CertPinning::enforce(reply, m_ServerCert);
+    }
     QEventLoop loop;
 
     // Connect the quit signals
@@ -534,10 +545,10 @@ NvHTTP::openConnection(QUrl baseUrl,
     // Time the request to distinguish a slow response from an unreachable host
     auto* connectTimer = new QTimer(reply);
     connectTimer->setSingleShot(true);
-    connect(connectTimer, &QTimer::timeout, reply, [reply, logLevel, url]() {
+    connect(connectTimer, &QTimer::timeout, reply, [reply, logLevel, command]() {
         if (!reply->isFinished()) {
             if (logLevel >= NvLogLevel::NVLL_ERROR) {
-                qWarning() << "Aborting timed out connection for" << url.toString();
+                qWarning() << "Aborting timed out connection for" << command;
             }
 
             reply->setProperty("timeout_reason", "connection_timeout");
@@ -549,7 +560,7 @@ NvHTTP::openConnection(QUrl baseUrl,
 #endif
 
     if (logLevel >= NvLogLevel::NVLL_VERBOSE) {
-        qInfo() << "Executing request:" << url.toString();
+        qInfo() << "Executing request:" << command;
     }
     loop.exec(QEventLoop::ExcludeUserInputEvents);
 
@@ -557,7 +568,7 @@ NvHTTP::openConnection(QUrl baseUrl,
     if (!reply->isFinished())
     {
         if (logLevel >= NvLogLevel::NVLL_ERROR) {
-            qWarning() << "Aborting timed out request for" << url.toString();
+            qWarning() << "Aborting timed out request for" << command;
         }
         reply->abort();
     }
@@ -566,7 +577,6 @@ NvHTTP::openConnection(QUrl baseUrl,
     // If we couldn't use fine-grained connection idle timeouts, kill them all now
     m_Nam->clearAccessCache();
 #endif
-    disconnect(sslErrorsConnection);
 
     // Handle error
     if (reply->error() != QNetworkReply::NoError)
@@ -575,10 +585,9 @@ NvHTTP::openConnection(QUrl baseUrl,
             qWarning() << command << "request failed with error:" << reply->error();
         }
 
-        if (reply->error() == QNetworkReply::SslHandshakeFailedError) {
-            // This will trigger falling back to HTTP for the serverinfo query
-            // then pairing again to get the updated certificate.
-            GfeHttpResponseException exception(401, "Server certificate mismatch");
+        if (reply->error() == QNetworkReply::SslHandshakeFailedError ||
+                (pinServerCert && CertPinning::wasRejected(reply))) {
+            GfeHttpResponseException exception(495, "Server certificate mismatch");
             delete reply;
             throw exception;
         }
@@ -592,10 +601,28 @@ NvHTTP::openConnection(QUrl baseUrl,
             throw exception;
         }
         else {
-            QtNetworkReplyException exception(reply->error(), reply->errorString());
+            QtNetworkReplyException exception(
+                reply->error(),
+                sanitizeReplyErrorString(reply->errorString(), url, reply->url()));
             delete reply;
             throw exception;
         }
+    }
+
+    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    if (status >= 300 && status < 400) {
+        delete reply;
+        throw GfeHttpResponseException(status, "HTTP redirects are not permitted");
+    }
+
+    // Defense in depth: never hand out data from an HTTPS peer that is not the pinned host
+    if (pinServerCert && !CertPinning::matchesPinned(m_ServerCert, reply->sslConfiguration().peerCertificate())) {
+        if (logLevel >= NvLogLevel::NVLL_ERROR) {
+            qWarning() << command << "response did not come from the pinned server certificate";
+        }
+        GfeHttpResponseException exception(495, "Server certificate mismatch");
+        delete reply;
+        throw exception;
     }
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 3, 0)

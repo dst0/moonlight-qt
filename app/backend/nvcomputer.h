@@ -18,6 +18,25 @@ public:
     CopySafeReadWriteLock& operator=(const CopySafeReadWriteLock &) { return *this; }
 };
 
+class NvHostAdapter
+{
+public:
+    bool operator==(const NvHostAdapter& other) const
+    {
+        return id == other.id &&
+               name == other.name &&
+               pciSlot == other.pciSlot &&
+               isDefault == other.isDefault &&
+               isCaptureDefault == other.isCaptureDefault;
+    }
+
+    QString id;
+    QString name;
+    QString pciSlot;
+    bool isDefault = false;
+    bool isCaptureDefault = false;
+};
+
 class NvComputer
 {
     friend class PcMonitorThread;
@@ -43,6 +62,9 @@ public:
     explicit NvComputer(NvHTTP& http, QString serverInfo);
 
     explicit NvComputer(QSettings& settings);
+
+    static bool
+    isValidUuid(const QString& uuid);
 
     void
     setRemoteAddress(QHostAddress);
@@ -100,6 +122,19 @@ public:
     int serverCodecModeSupport;
     QString gpuModel;
     bool isSupportedServerVersion;
+    // secure-desktop-stream: <sdsVersion>/<sdsFeatures>/<sdsEncoders>/<sdsAdapters>/<sdsPacked444MaxSize> from serverinfo (DESIGN 3.1)
+    int sdsVersion = 0;
+    QStringList sdsFeatures;
+    QStringList sdsEncoders;
+    int sdsSoftwareCodecModeSupport = 0;
+    QVector<NvHostAdapter> sdsAdapters;
+    int maxPackedWidth = 0;
+    int maxPackedHeight = 0;
+
+    bool hasSdsFeature(const QString& feature) const
+    {
+        return sdsFeatures.contains(feature);
+    }
 
     // Persisted traits
     NvAddress localAddress;

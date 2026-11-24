@@ -13,6 +13,11 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     : m_MultiController(prefs.multiController),
       m_GamepadMouse(prefs.gamepadMouse),
       m_SwapMouseButtons(prefs.swapMouseButtons),
+#ifdef Q_OS_DARWIN
+      m_SwapCmdCtrl(prefs.swapCmdCtrl),
+#else
+      m_SwapCmdCtrl(false),
+#endif
       m_ReverseScrollDirection(prefs.reverseScrollDirection),
       m_SwapFaceButtons(prefs.swapFaceButtons),
       m_MouseWasInVideoRegion(false),
@@ -134,6 +139,17 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     m_SpecialKeyCombos[KeyComboToggleKeyboardGrab].keyCode = SDLK_k;
     m_SpecialKeyCombos[KeyComboToggleKeyboardGrab].scanCode = SDL_SCANCODE_K;
     m_SpecialKeyCombos[KeyComboToggleKeyboardGrab].enabled = WMUtils::isRunningDesktopEnvironment();
+
+    // secure-desktop-stream: download the host outbox now (D is already "minimize")
+    m_SpecialKeyCombos[KeyComboSdsDownloadOutbox].keyCombo = KeyComboSdsDownloadOutbox;
+    m_SpecialKeyCombos[KeyComboSdsDownloadOutbox].keyCode = SDLK_o;
+    m_SpecialKeyCombos[KeyComboSdsDownloadOutbox].scanCode = SDL_SCANCODE_O;
+    m_SpecialKeyCombos[KeyComboSdsDownloadOutbox].enabled = true;
+    // secure-desktop-stream: mute/unmute microphone passthrough (Ctrl+Alt+Shift+U)
+    m_SpecialKeyCombos[KeyComboToggleMicMute].keyCombo = KeyComboToggleMicMute;
+    m_SpecialKeyCombos[KeyComboToggleMicMute].keyCode = SDLK_u;
+    m_SpecialKeyCombos[KeyComboToggleMicMute].scanCode = SDL_SCANCODE_U;
+    m_SpecialKeyCombos[KeyComboToggleMicMute].enabled = true;
 
     m_OldIgnoreDevices = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES);
     m_OldIgnoreDevicesExcept = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT);

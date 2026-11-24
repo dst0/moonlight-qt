@@ -1,8 +1,65 @@
 #include "boxartmanager.h"
 #include "../path.h"
 
+#include <QCryptographicHash>
+#include <QFileInfo>
 #include <QImageReader>
 #include <QImageWriter>
+
+namespace {
+
+QString resolveVerifiedBoxArtDir(const QString& rootPath, const QString& uuid, bool createIfMissing)
+{
+    if (rootPath.isEmpty() || !NvComputer::isValidUuid(uuid)) {
+        return QString();
+    }
+
+    const QString hostDirName = QString::fromLatin1(
+        QCryptographicHash::hash(uuid.toUtf8(), QCryptographicHash::Sha256).toHex());
+
+    QDir rootDir(rootPath);
+    if (createIfMissing && !rootDir.exists()) {
+        rootDir.mkpath(QStringLiteral("."));
+    }
+
+    QFileInfo rootInfo(rootDir.absolutePath());
+    if (!rootInfo.exists() || !rootInfo.isDir() || rootInfo.isSymLink()) {
+        return QString();
+    }
+    const QString canonicalRoot = rootInfo.canonicalFilePath();
+    if (canonicalRoot.isEmpty()) {
+        return QString();
+    }
+
+    const QString hostPath = QDir(canonicalRoot).filePath(hostDirName);
+    QFileInfo hostInfo(hostPath);
+    if (hostInfo.isSymLink()) {
+        return QString();
+    }
+    if (!hostInfo.exists()) {
+        if (!createIfMissing) {
+            return QString();
+        }
+        if (!QDir(canonicalRoot).mkdir(hostDirName)) {
+            return QString();
+        }
+        hostInfo.refresh();
+    }
+    if (hostInfo.isSymLink() || !hostInfo.isDir()) {
+        return QString();
+    }
+
+    const QString canonicalHost = hostInfo.canonicalFilePath();
+    if (canonicalHost.isEmpty() ||
+            QFileInfo(canonicalHost).dir().canonicalPath() != canonicalRoot ||
+            canonicalHost != QDir(canonicalRoot).filePath(hostDirName)) {
+        return QString();
+    }
+
+    return canonicalHost;
+}
+
+} // namespace
 
 BoxArtManager::BoxArtManager(QObject *parent) :
     QObject(parent),
@@ -22,18 +79,22 @@ BoxArtManager::BoxArtManager(QObject *parent) :
 QString
 BoxArtManager::getFilePathForBoxArt(NvComputer* computer, int appId)
 {
-    QDir dir = m_BoxArtDir;
-
-    // Create the cache directory if it did not already exist
-    if (!dir.exists(computer->uuid)) {
-        dir.mkdir(computer->uuid);
+    if (computer == nullptr) {
+        return QString();
     }
 
-    // Change to this computer's box art cache folder
-    dir.cd(computer->uuid);
+    QString uuid;
+    {
+        QReadLocker lock(&computer->lock);
+        uuid = computer->uuid;
+    }
 
-    // Try to open the cached file
-    return dir.filePath(QString::number(appId) + ".png");
+    const QString hostDirPath = resolveVerifiedBoxArtDir(Path::getBoxArtCacheDir(), uuid, true);
+    if (hostDirPath.isEmpty()) {
+        return QString();
+    }
+
+    return QDir(hostDirPath).filePath(QString::number(appId) + ".png");
 }
 
 class NetworkBoxArtLoadTask : public QObject, public QRunnable
@@ -72,7 +133,17 @@ private:
 QUrl BoxArtManager::loadBoxArt(NvComputer* computer, NvApp& app)
 {
     // Try to open the cached file if it exists and contains data
-    QFile cacheFile(getFilePathForBoxArt(computer, app.id));
+    const QString cachePath = getFilePathForBoxArt(computer, app.id);
+    if (cachePath.isEmpty()) {
+        return QUrl("qrc:/res/no_app_image.png");
+    }
+
+    QFileInfo cacheInfo(cachePath);
+    if (cacheInfo.isSymLink()) {
+        return QUrl("qrc:/res/no_app_image.png");
+    }
+
+    QFile cacheFile(cachePath);
     if (cacheFile.exists() && cacheFile.size() > 0) {
         return QUrl::fromLocalFile(cacheFile.fileName());
     }
@@ -89,12 +160,23 @@ QUrl BoxArtManager::loadBoxArt(NvComputer* computer, NvApp& app)
 
 void BoxArtManager::deleteBoxArt(NvComputer* computer)
 {
-    QDir dir(Path::getBoxArtCacheDir());
-
-    // Delete everything in this computer's box art directory
-    if (dir.cd(computer->uuid)) {
-        dir.removeRecursively();
+    if (computer == nullptr) {
+        return;
     }
+
+    QString uuid;
+    {
+        QReadLocker lock(&computer->lock);
+        uuid = computer->uuid;
+    }
+
+    const QString hostDirPath = resolveVerifiedBoxArtDir(Path::getBoxArtCacheDir(), uuid, false);
+    if (hostDirPath.isEmpty()) {
+        return;
+    }
+
+    QDir dir(hostDirPath);
+    dir.removeRecursively();
 }
 
 void BoxArtManager::handleBoxArtLoadComplete(NvComputer* computer, NvApp app, QUrl image)
@@ -106,9 +188,12 @@ void BoxArtManager::handleBoxArtLoadComplete(NvComputer* computer, NvApp app, QU
 
 QUrl BoxArtManager::loadBoxArtFromNetwork(NvComputer* computer, int appId)
 {
-    NvHTTP http(computer);
-
     QString cachePath = getFilePathForBoxArt(computer, appId);
+    if (cachePath.isEmpty() || QFileInfo(cachePath).isSymLink()) {
+        return QUrl();
+    }
+
+    NvHTTP http(computer);
     QImage image;
     try {
         image = http.getBoxArt(appId);

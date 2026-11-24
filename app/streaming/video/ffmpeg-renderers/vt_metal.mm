@@ -9,6 +9,7 @@
 #include <Limelight.h>
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
+#include "streaming/video/packed444.h"
 #include "path.h"
 
 #import <Cocoa/Cocoa.h>
@@ -33,6 +34,17 @@ struct ParamBuffer
     CscParams cscParams;
     simd_half2 chromaOffset;
     simd_half1 bitnessScaleFactor;
+};
+
+struct Packed444Params
+{
+    simd_uint2 logicalSize;
+    simd_uint2 codedSize;
+    uint32_t tileW;
+    uint32_t tileH;
+    uint32_t splitX;
+    uint32_t isScaled;
+    float lumaUnormScale;
 };
 
 struct Vertex
@@ -78,7 +90,14 @@ public:
           m_LastFrameWidth(-1),
           m_LastFrameHeight(-1),
           m_LastDrawableWidth(-1),
-          m_LastDrawableHeight(-1)
+          m_LastDrawableHeight(-1),
+          m_LastRenderWidth(-1),
+          m_LastRenderHeight(-1),
+          m_PackedYCoCgRMode(0),
+          m_LogicalWidth(0),
+          m_LogicalHeight(0),
+          m_LastPackedYCoCgRMode(-1),
+          m_PackedLayout{}
     {
     }
 
@@ -144,9 +163,12 @@ public:
         int drawableWidth, drawableHeight;
         SDL_Metal_GetDrawableSize(m_Window, &drawableWidth, &drawableHeight);
 
+        const int videoWidth = (m_PackedYCoCgRMode == 1 && m_LogicalWidth > 0) ? m_LogicalWidth : frame->width;
+        const int videoHeight = (m_PackedYCoCgRMode == 1 && m_LogicalHeight > 0) ? m_LogicalHeight : frame->height;
+
         // Check if anything has changed since the last vertex buffer upload
         if (m_VideoVertexBuffer &&
-                frame->width == m_LastFrameWidth && frame->height == m_LastFrameHeight &&
+                videoWidth == m_LastFrameWidth && videoHeight == m_LastFrameHeight &&
                 drawableWidth == m_LastDrawableWidth && drawableHeight == m_LastDrawableHeight) {
             // Nothing to do
             return true;
@@ -155,8 +177,8 @@ public:
         // Determine the correct scaled size for the video region
         SDL_Rect src, dst;
         src.x = src.y = 0;
-        src.w = frame->width;
-        src.h = frame->height;
+        src.w = videoWidth;
+        src.h = videoHeight;
         dst.x = dst.y = 0;
         dst.w = drawableWidth;
         dst.h = drawableHeight;
@@ -183,10 +205,12 @@ public:
             return false;
         }
 
-        m_LastFrameWidth = frame->width;
-        m_LastFrameHeight = frame->height;
+        m_LastFrameWidth = videoWidth;
+        m_LastFrameHeight = videoHeight;
         m_LastDrawableWidth = drawableWidth;
         m_LastDrawableHeight = drawableHeight;
+        m_LastRenderWidth = dst.w;
+        m_LastRenderHeight = dst.h;
 
         return true;
     }
@@ -221,18 +245,91 @@ public:
         }
     }
 
+    bool createOverlayPipelineState()
+    {
+        MTLRenderPipelineDescriptor *pipelineDesc = [[MTLRenderPipelineDescriptor new] autorelease];
+        pipelineDesc.vertexFunction = [[m_ShaderLibrary newFunctionWithName:@"vs_draw"] autorelease];
+        pipelineDesc.fragmentFunction = [[m_ShaderLibrary newFunctionWithName:@"ps_draw_rgb"] autorelease];
+        pipelineDesc.colorAttachments[0].pixelFormat = m_MetalLayer.pixelFormat;
+        pipelineDesc.colorAttachments[0].blendingEnabled = YES;
+        pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
+        pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        [m_OverlayPipelineState release];
+        m_OverlayPipelineState = [m_MetalLayer.device newRenderPipelineStateWithDescriptor:pipelineDesc error:nullptr];
+        if (!m_OverlayPipelineState) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Failed to create overlay pipeline state");
+            return false;
+        }
+
+        return true;
+    }
+
+    float getPackedLumaUnormScale(const AVFrame* frame) const
+    {
+        if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+            // VideoToolbox P010 (xf20/x420) places 10-bit samples in bits [15:6]
+            return 65535.0f / 64.0f;
+        }
+
+        const AVPixFmtDescriptor* formatDesc = av_pix_fmt_desc_get((AVPixelFormat)frame->format);
+        if (formatDesc && formatDesc->comp[0].shift == 6) {
+            return 65535.0f / 64.0f;
+        }
+
+        // Software AV_PIX_FMT_YUV420P10LE stores 10-bit samples in LSB [9:0]
+        // and mapPlaneForSoftwareFrame() uploads directly as MTLPixelFormatR16Unorm
+        return 65535.0f;
+    }
+
     bool updateColorSpaceForFrame(AVFrame* frame)
     {
-        if (!hasFrameFormatChanged(frame) && !m_HdrMetadataChanged) {
+        if (!hasFrameFormatChanged(frame) && !m_HdrMetadataChanged &&
+            m_VideoPipelineState != nullptr && m_LastPackedYCoCgRMode == m_PackedYCoCgRMode) {
+            return true;
+        }
+
+        // Stop the display link before changing the Metal layer
+        stopDisplayLink();
+
+        if (m_PackedYCoCgRMode == 1) {
+            CGColorSpaceRef newColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            m_MetalLayer.colorspace = newColorSpace;
+            m_MetalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            m_MetalLayer.EDRMetadata = nullptr;
+            CGColorSpaceRelease(newColorSpace);
+
+            [m_CscParamsBuffer release];
+            m_CscParamsBuffer = nullptr;
+
+            MTLRenderPipelineDescriptor *pipelineDesc = [[MTLRenderPipelineDescriptor new] autorelease];
+            pipelineDesc.vertexFunction = [[m_ShaderLibrary newFunctionWithName:@"vs_draw"] autorelease];
+            pipelineDesc.fragmentFunction = [[m_ShaderLibrary newFunctionWithName:@"ps_draw_ycocgr_a1"] autorelease];
+            pipelineDesc.colorAttachments[0].pixelFormat = m_MetalLayer.pixelFormat;
+            [m_VideoPipelineState release];
+            m_VideoPipelineState = [m_MetalLayer.device newRenderPipelineStateWithDescriptor:pipelineDesc error:nullptr];
+            if (!m_VideoPipelineState) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Failed to create packed YCoCg-R video pipeline state");
+                return false;
+            }
+
+            if (!createOverlayPipelineState()) {
+                return false;
+            }
+
+            m_HdrMetadataChanged = false;
+            m_LastPackedYCoCgRMode = m_PackedYCoCgRMode;
             return true;
         }
 
         int colorspace = getFrameColorspace(frame);
         CGColorSpaceRef newColorSpace;
         ParamBuffer paramBuffer;
-
-        // Stop the display link before changing the Metal layer
-        stopDisplayLink();
 
         switch (colorspace) {
         case COLORSPACE_REC_709:
@@ -311,26 +408,12 @@ public:
             return false;
         }
 
-        pipelineDesc = [[MTLRenderPipelineDescriptor new] autorelease];
-        pipelineDesc.vertexFunction = [[m_ShaderLibrary newFunctionWithName:@"vs_draw"] autorelease];
-        pipelineDesc.fragmentFunction = [[m_ShaderLibrary newFunctionWithName:@"ps_draw_rgb"] autorelease];
-        pipelineDesc.colorAttachments[0].pixelFormat = m_MetalLayer.pixelFormat;
-        pipelineDesc.colorAttachments[0].blendingEnabled = YES;
-        pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-        pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-        pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-        pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
-        pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-        pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-        [m_OverlayPipelineState release];
-        m_OverlayPipelineState = [m_MetalLayer.device newRenderPipelineStateWithDescriptor:pipelineDesc error:nullptr];
-        if (!m_OverlayPipelineState) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "Failed to create overlay pipeline state");
+        if (!createOverlayPipelineState()) {
             return false;
         }
 
         m_HdrMetadataChanged = false;
+        m_LastPackedYCoCgRMode = m_PackedYCoCgRMode;
         return true;
     }
 
@@ -476,12 +559,27 @@ public:
     // Caller frees frame after we return
     virtual void renderFrameIntoDrawable(AVFrame* frame, id<CAMetalDrawable> drawable)
     { @autoreleasepool {
+        if (m_PackedYCoCgRMode == 1 &&
+            (!m_PackedLayout.valid || frame->width < m_PackedLayout.encW || frame->height < m_PackedLayout.encH)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Packed YCoCg-R frame (%dx%d) smaller than expected coded layout (%dx%d)",
+                        frame->width, frame->height, m_PackedLayout.encW, m_PackedLayout.encH);
+            return;
+        }
+
         std::array<CVMetalTextureRef, MAX_VIDEO_PLANES> cvMetalTextures;
         size_t planes = getFramePlaneCount(frame);
         SDL_assert(planes <= MAX_VIDEO_PLANES);
 
+        id<MTLTexture> swLumaTex = nil;
         if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
             if (!createTexturesFromFrame(frame, cvMetalTextures)) {
+                return;
+            }
+        }
+        else if (m_PackedYCoCgRMode == 1) {
+            swLumaTex = mapPlaneForSoftwareFrame(frame, 0);
+            if (!swLumaTex) {
                 return;
             }
         }
@@ -498,8 +596,13 @@ public:
         // Bind textures and buffers then draw the video region
         [renderEncoder setRenderPipelineState:m_VideoPipelineState];
         if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
-            for (size_t i = 0; i < planes; i++) {
-                [renderEncoder setFragmentTexture:CVMetalTextureGetTexture(cvMetalTextures[i]) atIndex:i];
+            if (m_PackedYCoCgRMode == 1) {
+                [renderEncoder setFragmentTexture:CVMetalTextureGetTexture(cvMetalTextures[0]) atIndex:0];
+            }
+            else {
+                for (size_t i = 0; i < planes; i++) {
+                    [renderEncoder setFragmentTexture:CVMetalTextureGetTexture(cvMetalTextures[i]) atIndex:i];
+                }
             }
             [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
                 // Free textures after completion of rendering per CVMetalTextureCache requirements
@@ -508,12 +611,29 @@ public:
                 }
             }];
         }
+        else if (m_PackedYCoCgRMode == 1) {
+            [renderEncoder setFragmentTexture:swLumaTex atIndex:0];
+        }
         else {
             for (size_t i = 0; i < planes; i++) {
                 [renderEncoder setFragmentTexture:mapPlaneForSoftwareFrame(frame, i) atIndex:i];
             }
         }
-        [renderEncoder setFragmentBuffer:m_CscParamsBuffer offset:0 atIndex:0];
+
+        if (m_PackedYCoCgRMode == 1) {
+            Packed444Params packedParams = {};
+            packedParams.logicalSize = simd_make_uint2((uint32_t)m_LogicalWidth, (uint32_t)m_LogicalHeight);
+            packedParams.codedSize = simd_make_uint2((uint32_t)frame->width, (uint32_t)frame->height);
+            packedParams.tileW = (uint32_t)m_PackedLayout.tileW;
+            packedParams.tileH = (uint32_t)m_PackedLayout.tileH;
+            packedParams.splitX = (uint32_t)m_PackedLayout.splitX;
+            packedParams.isScaled = (m_LastRenderWidth != m_LogicalWidth || m_LastRenderHeight != m_LogicalHeight) ? 1u : 0u;
+            packedParams.lumaUnormScale = getPackedLumaUnormScale(frame);
+            [renderEncoder setFragmentBytes:&packedParams length:sizeof(packedParams) atIndex:0];
+        }
+        else {
+            [renderEncoder setFragmentBuffer:m_CscParamsBuffer offset:0 atIndex:0];
+        }
         [renderEncoder setVertexBuffer:m_VideoVertexBuffer offset:0 atIndex:0];
         [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 
@@ -663,6 +783,23 @@ public:
 
         m_Window = params->window;
         m_FrameRateRange = CAFrameRateRangeMake(params->frameRate, params->frameRate, params->frameRate);
+        m_PackedYCoCgRMode = params->packedYCoCgRMode;
+        m_LogicalWidth = params->logicalWidth;
+        m_LogicalHeight = params->logicalHeight;
+        m_LastPackedYCoCgRMode = -1;
+
+        if (m_PackedYCoCgRMode == 1 && !params->testOnly) {
+            m_PackedLayout = computePackedYCoCgRA1Layout(m_LogicalWidth,
+                                                         m_LogicalHeight,
+                                                         qMax(params->width, 8192),
+                                                         qMax(params->height, 4352));
+            if (!m_PackedLayout.valid) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Invalid packed YCoCg-R logical dimensions: %dx%d",
+                             m_LogicalWidth, m_LogicalHeight);
+                return false;
+            }
+        }
 
         id<MTLDevice> device = getMetalDevice();
         if (!device) {
@@ -714,10 +851,12 @@ public:
 
         // Compile our shaders
         QString shaderSource = QString::fromUtf8(Path::readDataFile("vt_renderer.metal"));
-        m_ShaderLibrary = [device newLibraryWithSource:shaderSource.toNSString() options:nullptr error:nullptr];
+        NSError *shaderError = nil;
+        m_ShaderLibrary = [device newLibraryWithSource:shaderSource.toNSString() options:nullptr error:&shaderError];
         if (!m_ShaderLibrary) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "Failed to compile shaders");
+                         "Failed to compile shaders: %s",
+                         shaderError ? shaderError.localizedDescription.UTF8String : "unknown");
             return false;
         }
 
@@ -742,8 +881,9 @@ public:
             // Choose a device
             m_MetalLayer.device = device;
 
-            // Allow EDR content if we're streaming in a 10-bit format
-            m_MetalLayer.wantsExtendedDynamicRangeContent = !!(params->videoFormat & VIDEO_FORMAT_MASK_10BIT);
+            // Allow EDR content if we're streaming in a 10-bit HDR format (never for SDR packed 4:4:4)
+            m_MetalLayer.wantsExtendedDynamicRangeContent =
+                (m_PackedYCoCgRMode == 0) && !!(params->videoFormat & VIDEO_FORMAT_MASK_10BIT);
 
             // Allow tearing if V-Sync is off (also requires direct display path)
             m_MetalLayer.displaySyncEnabled = params->enableVsync;
@@ -968,6 +1108,13 @@ private:
     int m_LastFrameHeight;
     int m_LastDrawableWidth;
     int m_LastDrawableHeight;
+    int m_LastRenderWidth;
+    int m_LastRenderHeight;
+    int m_PackedYCoCgRMode;
+    int m_LogicalWidth;
+    int m_LogicalHeight;
+    int m_LastPackedYCoCgRMode;
+    PackedYCoCgRLayout m_PackedLayout;
 };
 
 @implementation DisplayLinkDelegate {
@@ -988,4 +1135,19 @@ private:
 
 IFFmpegRenderer* VTMetalRendererFactory::createRenderer(bool hwAccel) {
     return new VTMetalRenderer(hwAccel);
+}
+
+bool VTMetalRendererFactory::isMetalAvailable() {
+@autoreleasepool {
+    if (qgetenv("VT_FORCE_METAL") == "0") {
+        return false;
+    }
+
+    NSArray<id<MTLDevice>> *devices = [MTLCopyAllDevices() autorelease];
+    if (devices.count > 0) {
+        return true;
+    }
+
+    return [MTLCreateSystemDefaultDevice() autorelease] != nil;
+}
 }

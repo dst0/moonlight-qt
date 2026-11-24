@@ -152,17 +152,19 @@ win32 {
     LIBS += -llibssl -llibcrypto -lSDL2 -lSDL2_ttf -lavcodec -lavutil -lswscale -lopus -ldxgi -ld3d11 -llibplacebo
     CONFIG += ffmpeg libplacebo
 }
-win32:!winrt {
-    CONFIG += discord-rpc
-}
 macx {
     !disable-prebuilts {
         LIBS += -lssl.3 -lcrypto.3 -lavcodec.63 -lavutil.61 -lswscale.10 -lopus.0 -lSDL2 -lSDL2_ttf -lplacebo
-        CONFIG += discord-rpc libplacebo
+        CONFIG += libplacebo
     }
 
     LIBS += -lobjc -framework VideoToolbox -framework AVFoundation -framework CoreVideo -framework CoreGraphics -framework CoreMedia -framework AppKit -framework Metal -framework QuartzCore
     CONFIG += ffmpeg
+
+    # The client private key is stored in the macOS Keychain
+    LIBS += -framework Security -framework CoreFoundation
+    SOURCES += backend/keychain_mac.cpp
+    HEADERS += backend/keychain_mac.h
 }
 
 SOURCES += \
@@ -177,18 +179,18 @@ SOURCES += \
     backend/nvpairingmanager.cpp \
     backend/computermanager.cpp \
     backend/boxartmanager.cpp \
-    backend/richpresencemanager.cpp \
+    backend/certpinning.cpp \
+    backend/lanpolicy.cpp \
     cli/commandlineparser.cpp \
     cli/listapps.cpp \
     cli/quitstream.cpp \
     cli/startstream.cpp \
-    settings/compatfetcher.cpp \
-    settings/mappingfetcher.cpp \
     settings/streamingpreferences.cpp \
     streaming/input/abstouch.cpp \
     streaming/input/gamepad.cpp \
     streaming/input/input.cpp \
     streaming/input/keyboard.cpp \
+    streaming/input/keymapping.cpp \
     streaming/input/mouse.cpp \
     streaming/input/reltouch.cpp \
     streaming/session.cpp \
@@ -198,7 +200,7 @@ SOURCES += \
     gui/appmodel.cpp \
     streaming/bandwidth.cpp \
     streaming/streamutils.cpp \
-    backend/autoupdatechecker.cpp \
+    streaming/video/packed444.cpp \
     path.cpp \
     settings/mappingmanager.cpp \
     gui/sdlgamepadkeynavigation.cpp \
@@ -211,37 +213,76 @@ HEADERS += \
     backend/nvaddress.h \
     backend/nvapp.h \
     cli/pair.h \
-    settings/compatfetcher.h \
-    settings/mappingfetcher.h \
     utils.h \
     backend/computerseeker.h \
     backend/identitymanager.h \
     backend/nvcomputer.h \
     backend/nvhttp.h \
+    backend/sdslaunchparams.h \
     backend/nvpairingmanager.h \
     backend/computermanager.h \
     backend/boxartmanager.h \
-    backend/richpresencemanager.h \
+    backend/certpinning.h \
+    backend/lanpolicy.h \
     cli/commandlineparser.h \
     cli/listapps.h \
     cli/quitstream.h \
     cli/startstream.h \
     settings/streamingpreferences.h \
     streaming/input/input.h \
+    streaming/input/keymapping.h \
     streaming/session.h \
     streaming/audio/renderers/renderer.h \
     streaming/audio/renderers/sdl.h \
     gui/computermodel.h \
     gui/appmodel.h \
     streaming/video/decoder.h \
+    streaming/video/packed444.h \
     streaming/bandwidth.h \
     streaming/streamutils.h \
-    backend/autoupdatechecker.h \
     path.h \
     settings/mappingmanager.h \
     gui/sdlgamepadkeynavigation.h \
     streaming/video/overlaymanager.h \
     backend/systemproperties.h
+
+# secure-desktop-stream: shared clipboard and in-stream file transfer
+SOURCES += \
+    backend/sdsclient.cpp \
+    streaming/sds/clipboardsync.cpp \
+    streaming/sds/fileclipboard.cpp \
+    streaming/sds/filesanitize.cpp \
+    streaming/sds/sdscontroller.cpp \
+    streaming/sds/sdssession.cpp
+HEADERS += \
+    backend/sdsclient.h \
+    streaming/sds/clipboard_platform.h \
+    streaming/sds/clipboardsync.h \
+    streaming/sds/fileclipboard.h \
+    streaming/sds/filesanitize.h \
+    streaming/sds/sdscontroller.h \
+    streaming/sds/sdssession.h \
+    streaming/sds/sdstypes.h
+macx {
+    SOURCES += streaming/sds/clipboard_mac.mm
+} else {
+    SOURCES += streaming/sds/clipboard_null.cpp
+}
+
+# secure-desktop-stream: microphone passthrough (capture backend on macOS only)
+SOURCES += \
+    streaming/audio/micsession.cpp \
+    streaming/audio/micstreamer.cpp
+HEADERS += \
+    streaming/audio/miccapture.h \
+    streaming/audio/micsession.h \
+    streaming/audio/micstreamer.h
+macx {
+    SOURCES += streaming/audio/miccapture_mac.mm
+    HEADERS += streaming/audio/miccapture_format_mac.h
+} else {
+    SOURCES += streaming/audio/miccapture_none.cpp
+}
 
 # Platform-specific renderers and decoders
 ffmpeg {
@@ -415,12 +456,6 @@ macx {
     HEADERS += \
         streaming/video/ffmpeg-renderers/vt.h
 }
-discord-rpc {
-    message(Discord integration enabled)
-
-    LIBS += -ldiscord-rpc
-    DEFINES += HAVE_DISCORD
-}
 embedded {
     message(Embedded build)
 
@@ -555,8 +590,8 @@ win32 {
 }
 macx {
     # Create Info.plist in object dir with the correct version string
-    system(cp $$PWD/Info.plist $$OUT_PWD/Info.plist)
-    system(sed -i -e 's/VERSION/$$cat(version.txt)/g' $$OUT_PWD/Info.plist)
+    system(cp $$shell_quote($$PWD/Info.plist) $$shell_quote($$OUT_PWD/Info.plist))
+    system(sed -i -e 's/VERSION/$$cat(version.txt)/g' $$shell_quote($$OUT_PWD/Info.plist))
 
     QMAKE_INFO_PLIST = $$OUT_PWD/Info.plist
 

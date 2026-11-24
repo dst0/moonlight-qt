@@ -3,6 +3,8 @@
 #include <QObject>
 #include <QRect>
 #include <QQmlEngine>
+#include <QStringList>
+#include <QVariantMap>
 
 class StreamingPreferences : public QObject
 {
@@ -43,6 +45,16 @@ public:
         VDS_FORCE_SOFTWARE
     };
     Q_ENUM(VideoDecoderSelection)
+
+    // secure-desktop-stream: per-session host encoder override
+    enum HostEncoderConfig
+    {
+        HEC_AUTO,
+        HEC_HARDWARE_VAAPI,
+        HEC_HARDWARE_VULKAN,
+        HEC_SOFTWARE
+    };
+    Q_ENUM(HostEncoderConfig)
 
     // Mac only (for now)
     enum RendererSelection
@@ -136,9 +148,7 @@ public:
     Q_PROPERTY(bool framePacing MEMBER framePacing NOTIFY framePacingChanged)
     Q_PROPERTY(bool connectionWarnings MEMBER connectionWarnings NOTIFY connectionWarningsChanged)
     Q_PROPERTY(bool configurationWarnings MEMBER configurationWarnings NOTIFY configurationWarningsChanged)
-    Q_PROPERTY(bool richPresence MEMBER richPresence NOTIFY richPresenceChanged)
     Q_PROPERTY(bool gamepadMouse MEMBER gamepadMouse NOTIFY gamepadMouseChanged)
-    Q_PROPERTY(bool detectNetworkBlocking MEMBER detectNetworkBlocking NOTIFY detectNetworkBlockingChanged)
     Q_PROPERTY(bool showPerformanceOverlay MEMBER showPerformanceOverlay NOTIFY showPerformanceOverlayChanged)
     Q_PROPERTY(AudioConfig audioConfig MEMBER audioConfig NOTIFY audioConfigChanged)
     Q_PROPERTY(VideoCodecConfig videoCodecConfig MEMBER videoCodecConfig NOTIFY videoCodecConfigChanged)
@@ -150,15 +160,56 @@ public:
     Q_PROPERTY(WindowMode recommendedFullScreenMode MEMBER recommendedFullScreenMode CONSTANT)
     Q_PROPERTY(UIDisplayMode uiDisplayMode MEMBER uiDisplayMode NOTIFY uiDisplayModeChanged)
     Q_PROPERTY(bool swapMouseButtons MEMBER swapMouseButtons NOTIFY mouseButtonsChanged)
+    Q_PROPERTY(bool swapCmdCtrl MEMBER swapCmdCtrl NOTIFY swapCmdCtrlChanged)
     Q_PROPERTY(bool muteOnFocusLoss MEMBER muteOnFocusLoss NOTIFY muteOnFocusLossChanged)
     Q_PROPERTY(bool backgroundGamepad MEMBER backgroundGamepad NOTIFY backgroundGamepadChanged)
     Q_PROPERTY(bool reverseScrollDirection MEMBER reverseScrollDirection NOTIFY reverseScrollDirectionChanged)
     Q_PROPERTY(bool swapFaceButtons MEMBER swapFaceButtons NOTIFY swapFaceButtonsChanged)
     Q_PROPERTY(bool keepAwake MEMBER keepAwake NOTIFY keepAwakeChanged)
+    // secure-desktop-stream: microphone passthrough
+    Q_PROPERTY(bool micPassthrough MEMBER micPassthrough NOTIFY micPassthroughChanged)
+    Q_PROPERTY(bool micEchoCancellation MEMBER micEchoCancellation NOTIFY micEchoCancellationChanged)
+    Q_PROPERTY(bool micCaptureSupported READ isMicCaptureSupported CONSTANT)
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
     Q_PROPERTY(Language language MEMBER language NOTIFY languageChanged);
 
+    // secure-desktop-stream: clipboard and file transfer
+    Q_PROPERTY(bool clipboardSync MEMBER clipboardSync NOTIFY clipboardSyncChanged)
+    Q_PROPERTY(bool fileTransfer MEMBER fileTransfer NOTIFY fileTransferChanged)
+    Q_PROPERTY(bool fileClipboard MEMBER fileClipboard NOTIFY fileClipboardChanged)
+    Q_PROPERTY(bool autoDownloadOutbox MEMBER autoDownloadOutbox NOTIFY autoDownloadOutboxChanged)
+
+    // secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
+    Q_PROPERTY(HostEncoderConfig hostEncoderConfig MEMBER hostEncoderConfig NOTIFY hostEncoderConfigChanged)
+    Q_PROPERTY(QVariantMap hostAdapterOverrides MEMBER hostAdapterOverrides NOTIFY hostAdapterOverridesChanged)
+    Q_PROPERTY(QVariantMap hostCaptureAdapterOverrides MEMBER hostCaptureAdapterOverrides NOTIFY hostCaptureAdapterOverridesChanged)
+    Q_PROPERTY(bool matchHostResolution MEMBER matchHostResolution NOTIFY matchHostResolutionChanged)
+    Q_PROPERTY(bool revertHostResolution MEMBER revertHostResolution NOTIFY revertHostResolutionChanged)
+
     Q_INVOKABLE bool retranslate();
+    Q_INVOKABLE QString hostAdapterOverride(const QString& fingerprint) const;
+    Q_INVOKABLE void setHostAdapterOverride(const QString& fingerprint, const QString& adapterId);
+    Q_INVOKABLE QString hostCaptureAdapterOverride(const QString& fingerprint) const;
+    Q_INVOKABLE void setHostCaptureAdapterOverride(const QString& fingerprint, const QString& adapterId);
+    Q_INVOKABLE static QString hostEncoderQueryValue(HostEncoderConfig config)
+    {
+        switch (config) {
+        case HEC_HARDWARE_VAAPI:
+            return QStringLiteral("vaapi");
+        case HEC_HARDWARE_VULKAN:
+            return QStringLiteral("vulkan");
+        case HEC_SOFTWARE:
+            return QStringLiteral("software");
+        case HEC_AUTO:
+        default:
+            return QStringLiteral("auto");
+        }
+    }
+    Q_INVOKABLE bool effectiveRevertHostResolution() const { return matchHostResolution && revertHostResolution; }
+
+    // secure-desktop-stream: asks for macOS microphone access (no-op if already decided)
+    Q_INVOKABLE void requestMicrophonePermission();
+    bool isMicCaptureSupported() const;
 
     // Directly accessible members for preferences
     int width;
@@ -178,16 +229,18 @@ public:
     bool framePacing;
     bool connectionWarnings;
     bool configurationWarnings;
-    bool richPresence;
     bool gamepadMouse;
-    bool detectNetworkBlocking;
     bool showPerformanceOverlay;
     bool swapMouseButtons;
+    bool swapCmdCtrl;
     bool muteOnFocusLoss;
     bool backgroundGamepad;
     bool reverseScrollDirection;
     bool swapFaceButtons;
     bool keepAwake;
+    // secure-desktop-stream: microphone passthrough
+    bool micPassthrough;
+    bool micEchoCancellation;
     int packetSize;
     AudioConfig audioConfig;
     VideoCodecConfig videoCodecConfig;
@@ -200,6 +253,21 @@ public:
     Language language;
     CaptureSysKeysMode captureSysKeysMode;
     RendererSelection rendererSelection;
+
+    // secure-desktop-stream: clipboard and file transfer
+    bool clipboardSync;
+    bool fileTransfer;
+    bool fileClipboard;
+    // Explicitly approved SHA-256 pinned-certificate fingerprints; empty by default.
+    QStringList fileClipboardHosts;
+    bool autoDownloadOutbox;
+
+    // secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
+    HostEncoderConfig hostEncoderConfig;
+    QVariantMap hostAdapterOverrides;
+    QVariantMap hostCaptureAdapterOverrides;
+    bool matchHostResolution;
+    bool revertHostResolution;
 
 signals:
     void displayModeChanged();
@@ -225,19 +293,34 @@ signals:
     void framePacingChanged();
     void connectionWarningsChanged();
     void configurationWarningsChanged();
-    void richPresenceChanged();
     void gamepadMouseChanged();
-    void detectNetworkBlockingChanged();
     void showPerformanceOverlayChanged();
     void mouseButtonsChanged();
+    void swapCmdCtrlChanged();
     void muteOnFocusLossChanged();
     void backgroundGamepadChanged();
     void reverseScrollDirectionChanged();
     void swapFaceButtonsChanged();
     void captureSysKeysModeChanged();
     void keepAwakeChanged();
+    // secure-desktop-stream: microphone passthrough
+    void micPassthroughChanged();
+    void micEchoCancellationChanged();
     void languageChanged();
     void rendererSelectionChanged();
+
+    // secure-desktop-stream: clipboard and file transfer
+    void clipboardSyncChanged();
+    void fileTransferChanged();
+    void fileClipboardChanged();
+    void autoDownloadOutboxChanged();
+
+    // secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
+    void hostEncoderConfigChanged();
+    void hostAdapterOverridesChanged();
+    void hostCaptureAdapterOverridesChanged();
+    void matchHostResolutionChanged();
+    void revertHostResolutionChanged();
 
 private:
     explicit StreamingPreferences(QQmlEngine *qmlEngine);

@@ -666,6 +666,50 @@ Flickable {
                     }
                 }
 
+                CheckBox {
+                    id: matchHostResolutionCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Match host resolution while streaming")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.matchHostResolution
+                    onCheckedChanged: {
+                        if (StreamingPreferences.matchHostResolution !== checked) {
+                            StreamingPreferences.matchHostResolution = checked
+                        }
+                        if (!checked && StreamingPreferences.revertHostResolution) {
+                            StreamingPreferences.revertHostResolution = false
+                        }
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Switches the host desktop resolution and refresh rate to match your Moonlight stream resolution on launch (when supported by Sunshine).")
+                }
+
+                CheckBox {
+                    id: revertHostResolutionCheck
+                    x: 20
+                    hoverEnabled: true
+                    width: parent.width - 20
+                    enabled: StreamingPreferences.matchHostResolution
+                    text: qsTr("Revert host resolution when stream ends")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.matchHostResolution && StreamingPreferences.revertHostResolution
+                    onCheckedChanged: {
+                        if (StreamingPreferences.matchHostResolution &&
+                                StreamingPreferences.revertHostResolution !== checked) {
+                            StreamingPreferences.revertHostResolution = checked
+                        }
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Restores the host desktop to its original resolution when the stream disconnects. Leaving this unchecked keeps the stream resolution on the host.")
+                }
+
                 Label {
                     width: parent.width
                     id: bitrateTitle
@@ -964,6 +1008,46 @@ Flickable {
                     ToolTip.timeout: 5000
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("Mutes Moonlight's audio when you Alt+Tab out of the stream or click on a different window.")
+                }
+
+                // secure-desktop-stream: microphone passthrough
+                CheckBox {
+                    id: micPassthroughCheck
+                    width: parent.width
+                    text: qsTr("Send my microphone to the host PC")
+                    font.pointSize: 12
+                    visible: StreamingPreferences.micCaptureSupported
+                    checked: StreamingPreferences.micPassthrough
+                    onCheckedChanged: {
+                        StreamingPreferences.micPassthrough = checked
+                        if (checked) {
+                            // Ask for macOS microphone access now rather than mid-stream
+                            StreamingPreferences.requestMicrophonePermission()
+                        }
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Only works with hosts that offer microphone passthrough to this client. Press Ctrl+Alt+Shift+U during the stream to mute or unmute.")
+                }
+
+                CheckBox {
+                    id: micEchoCancellationCheck
+                    width: parent.width
+                    text: qsTr("Cancel echo from the stream audio on my microphone")
+                    font.pointSize: 12
+                    visible: StreamingPreferences.micCaptureSupported
+                    enabled: micPassthroughCheck.checked
+                    checked: StreamingPreferences.micEchoCancellation
+                    onCheckedChanged: {
+                        StreamingPreferences.micEchoCancellation = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Uses voice processing so host audio played through your speakers is not sent back to the host.")
                 }
             }
         }
@@ -1274,23 +1358,6 @@ Flickable {
                 }
 
                 CheckBox {
-                    visible: SystemProperties.hasDiscordIntegration
-                    id: discordPresenceCheck
-                    width: parent.width
-                    text: qsTr("Discord Rich Presence integration")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.richPresence
-                    onCheckedChanged: {
-                        StreamingPreferences.richPresence = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Updates your Discord status to display the name of the game you're streaming.")
-                }
-
-                CheckBox {
                     id: keepAwakeCheck
                     width: parent.width
                     text: qsTr("Keep the display awake while streaming")
@@ -1452,6 +1519,24 @@ Flickable {
                 }
 
                 CheckBox {
+                    id: swapCmdCtrlCheck
+                    visible: SystemProperties.isDarwin
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Swap Command and Control keys")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.swapCmdCtrl
+                    onCheckedChanged: {
+                        StreamingPreferences.swapCmdCtrl = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Sends Command as Control and Control as the Windows key, so shortcuts like Command+C and Command+V act as Ctrl+C and Ctrl+V on the host.")
+                }
+
+                CheckBox {
                     id: reverseScrollButtonsCheck
                     hoverEnabled: true
                     width: parent.width
@@ -1536,6 +1621,82 @@ Flickable {
                     ToolTip.timeout: 5000
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("Allows Moonlight to capture gamepad inputs even if it's not the current window in focus")
+                }
+            }
+        }
+
+        // secure-desktop-stream: clipboard and file transfer
+        GroupBox {
+            id: sdsSettingsGroupBox
+            width: (parent.width - (parent.leftPadding + parent.rightPadding))
+            padding: 12
+            title: "<font color=\"skyblue\">" + qsTr("Clipboard and File Transfer") + "</font>"
+            font.pointSize: 12
+
+            Column {
+                anchors.fill: parent
+                spacing: 5
+
+                CheckBox {
+                    id: sdsClipboardSyncCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Share the clipboard with the host while streaming")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.clipboardSync
+                    onCheckedChanged: {
+                        StreamingPreferences.clipboardSync = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Text and images copied on either side become available on the other side. The host must grant this client clipboard permission.")
+                }
+
+                CheckBox {
+                    id: sdsFileTransferCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    text: qsTr("Allow file transfer while streaming")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.fileTransfer
+                    onCheckedChanged: {
+                        StreamingPreferences.fileTransfer = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Drop files onto the stream window to send them to the host. Files the host puts in its outbox are saved to Downloads/Moonlight (Ctrl+Alt+Shift+O downloads them on demand).")
+                }
+
+                CheckBox {
+                    id: sdsAutoDownloadCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    enabled: sdsFileTransferCheck.checked
+                    text: qsTr("Download files from the host outbox automatically")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.autoDownloadOutbox
+                    onCheckedChanged: {
+                        StreamingPreferences.autoDownloadOutbox = checked
+                    }
+                }
+
+                CheckBox {
+                    id: sdsFileClipboardCheck
+                    hoverEnabled: true
+                    width: parent.width
+                    enabled: sdsClipboardSyncCheck.checked && sdsFileTransferCheck.checked
+                    text: qsTr("Copy files between approved paired computers")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.fileClipboard
+                    onCheckedChanged: StreamingPreferences.fileClipboard = checked
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Copying files during a stream exchanges metadata first and transfers bytes on demand when you Paste into Finder or the host file manager. Requires separate host approval and clipboard/file permissions. Folders and Cut are unsupported.")
                 }
             }
         }
@@ -1712,6 +1873,69 @@ Flickable {
                     }
                 }
 
+                Label {
+                    width: parent.width
+                    id: hostEncoderTitle
+                    text: qsTr("Host video encoder")
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                }
+
+                AutoResizingComboBox {
+                    function syncHostEncoderIndex() {
+                        var saved_he = StreamingPreferences.hostEncoderConfig
+                        currentIndex = 0
+                        for (var i = 0; i < hostEncoderListModel.count; i++) {
+                            if (saved_he === hostEncoderListModel.get(i).val) {
+                                currentIndex = i
+                                break
+                            }
+                        }
+                    }
+
+                    Component.onCompleted: {
+                        syncHostEncoderIndex()
+                        activated(currentIndex)
+                    }
+
+                    Connections {
+                        target: StreamingPreferences
+                        function onHostEncoderConfigChanged() {
+                            hostEncoderComboBox.syncHostEncoderIndex()
+                        }
+                    }
+
+                    id: hostEncoderComboBox
+                    textRole: "text"
+                    model: ListModel {
+                        id: hostEncoderListModel
+                        ListElement {
+                            text: qsTr("Automatic (Host default)")
+                            val: StreamingPreferences.HEC_AUTO
+                        }
+                        ListElement {
+                            text: qsTr("Hardware (VAAPI / GPU)")
+                            val: StreamingPreferences.HEC_HARDWARE_VAAPI
+                        }
+                        ListElement {
+                            text: qsTr("Hardware (Vulkan)")
+                            val: StreamingPreferences.HEC_HARDWARE_VULKAN
+                        }
+                        ListElement {
+                            text: qsTr("Software (CPU — enables YUV 4:4:4)")
+                            val: StreamingPreferences.HEC_SOFTWARE
+                        }
+                    }
+                    onActivated: {
+                        if (enabled) {
+                            var selectedVal = hostEncoderListModel.get(currentIndex).val
+                            if (StreamingPreferences.hostEncoderConfig !== selectedVal) {
+                                StreamingPreferences.hostEncoderConfig = selectedVal
+                            }
+                        }
+                    }
+                }
+
                 CheckBox {
                     id: enableYUV444
                     width: parent.width
@@ -1740,6 +1964,64 @@ Flickable {
                                       qsTr("Good for streaming desktop and text-heavy games, but not recommended for fast-paced games.")
                                     :
                                       qsTr("YUV 4:4:4 is not supported on this PC.")
+                }
+
+                Label {
+                    id: yuv444StatusLabel
+                    width: parent.width
+                    leftPadding: 28
+                    font.pointSize: 10
+                    wrapMode: Text.Wrap
+                    visible: enableYUV444.checked && text.length > 0
+
+                    readonly property bool hostSwEncoder: StreamingPreferences.hostEncoderConfig === StreamingPreferences.HEC_SOFTWARE
+                    readonly property bool hostVulkanEncoder: StreamingPreferences.hostEncoderConfig === StreamingPreferences.HEC_HARDWARE_VULKAN
+                    readonly property bool hdrActive: enableHdr.checked
+                    readonly property bool badCodec: StreamingPreferences.videoCodecConfig === StreamingPreferences.VCC_FORCE_H264 ||
+                                                     StreamingPreferences.videoCodecConfig === StreamingPreferences.VCC_FORCE_AV1
+                    readonly property bool badRenderer: SystemProperties.isDarwin &&
+                                                        StreamingPreferences.rendererSelection !== StreamingPreferences.RS_AUTO &&
+                                                        StreamingPreferences.rendererSelection !== StreamingPreferences.RS_METAL
+                    readonly property int packedTileW: Math.floor((StreamingPreferences.width + 63) / 64) * 64
+                    readonly property int packedHalfW: Math.floor((Math.floor((StreamingPreferences.width + 1) / 2) + 63) / 64) * 64
+                    readonly property int packedTileH: Math.floor((StreamingPreferences.height + 63) / 64) * 64
+                    readonly property bool packedResTooSmall: StreamingPreferences.width < 64 || StreamingPreferences.height < 64
+                    readonly property bool packedResExceeds4K: (packedTileW + packedHalfW) > 8192 || (2 * packedTileH) > 4352
+                    readonly property bool hasWarning: !hostSwEncoder && (hostVulkanEncoder || hdrActive || badCodec || badRenderer || packedResTooSmall || packedResExceeds4K)
+
+                    color: hasWarning ? "#ffcc66" : "#8fbce6"
+                    text: {
+                        if (!enableYUV444.checked) {
+                            return ""
+                        }
+                        if (hostSwEncoder) {
+                            return qsTr("Host Software (CPU) encoder selected: uses native 4:4:4 directly (H.264 / HEVC).")
+                        }
+                        var warnings = []
+                        if (hostVulkanEncoder) {
+                            warnings.push(qsTr("Packed hardware 4:4:4 requires Automatic or VAAPI host encoder; Vulkan host encoder falls back to 4:2:0 on hosts without native 4:4:4."))
+                        }
+                        if (hdrActive) {
+                            warnings.push(qsTr("Packed hardware 4:4:4 (used on hosts without native 4:4:4) cannot be combined with HDR and will stream 10-bit HDR 4:2:0."))
+                        }
+                        if (badCodec) {
+                            warnings.push(qsTr("Packed hardware 4:4:4 requires Automatic or HEVC codec; forcing H.264/AV1 falls back to 4:2:0 on hosts without native 4:4:4."))
+                        }
+                        if (badRenderer) {
+                            warnings.push(qsTr("Packed hardware 4:4:4 requires Automatic or Metal renderer on macOS; Vulkan/AVSampleBufferDisplayLayer falls back to 4:2:0 on hosts without native 4:4:4."))
+                        }
+                        if (packedResTooSmall) {
+                            warnings.push(qsTr("Selected resolution is below the 64x64 minimum for packed hardware 4:4:4."))
+                        } else if (packedResExceeds4K) {
+                            warnings.push(qsTr("Selected resolution exceeds the default 4K (3840x2160) limit for packed hardware 4:4:4 on hosts without native 4:4:4."))
+                        }
+                        if (warnings.length > 0) {
+                            return warnings.join("\n")
+                        }
+                        return SystemProperties.isDarwin
+                            ? qsTr("Uses native 4:4:4 when the host supports it, or packed 10-bit HEVC YCoCg-R 4:4:4 via Metal on compatible hosts (4:2:0 fallback on legacy hosts).")
+                            : qsTr("Uses native 4:4:4 when the host supports it (falls back to 4:2:0 on unsupported hosts).")
+                    }
                 }
 
                 CheckBox {
@@ -1779,17 +2061,6 @@ Flickable {
                                 ComputerManager.startPolling()
                             }
                         }
-                    }
-                }
-
-                CheckBox {
-                    id: detectNetworkBlocking
-                    width: parent.width
-                    text: qsTr("Automatically detect blocked connections (Recommended)")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.detectNetworkBlocking
-                    onCheckedChanged: {
-                        StreamingPreferences.detectNetworkBlocking = checked
                     }
                 }
 
