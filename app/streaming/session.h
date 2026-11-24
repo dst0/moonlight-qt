@@ -8,6 +8,8 @@
 #include "settings/streamingpreferences.h"
 #include "input/input.h"
 #include "video/decoder.h"
+#include "video/adaptiverefinement.h"
+#include "video/adaptiverefinement_codec.h"
 #include "video/packed444.h"
 #include "audio/renderers/renderer.h"
 #include "video/overlaymanager.h"
@@ -202,7 +204,9 @@ private:
                        IVideoDecoder*& chosenDecoder,
                        int packedYCoCgRMode = 0,
                        int logicalWidth = 0,
-                       int logicalHeight = 0);
+                       int logicalHeight = 0,
+                       bool adaptiveTileRefinement = false,
+                       std::shared_ptr<AdaptiveTileInbox> refinementInbox = {});
 
     static
     void clStageStarting(int stage);
@@ -288,6 +292,9 @@ private:
     Packed444Decision m_Packed444Decision;
     PackedYCoCgRLayout m_Packed444Layout;
     bool m_UsePackedYCoCgRA1;
+    AdaptiveRefinementDecision m_AdaptiveRefinementDecision;
+    bool m_AdaptiveRefinementActive;
+    std::shared_ptr<AdaptiveTileInbox> m_RefinementInbox;
 
     OpusMSDecoder* m_OpusDecoder;
     IAudioRenderer* m_AudioRenderer;

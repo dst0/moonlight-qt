@@ -172,7 +172,8 @@ public:
              bool persistGameControllersOnDisconnect,
              QString& rtspSessionUrl,
              const QString& sdsChromaMode = QString(),
-             QString extraQueryParams = QString());
+             QString extraQueryParams = QString(),
+             bool sdsTileRefinement = false);
 
     QVector<NvApp>
     getAppList();

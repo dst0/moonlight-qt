@@ -4,6 +4,10 @@
 #include "SDL_compat.h"
 #include "settings/streamingpreferences.h"
 
+#include <memory>
+
+class AdaptiveTileInbox;
+
 #define SDL_CODE_FRAME_READY 0
 
 #define MAX_SLICES 4
@@ -48,6 +52,8 @@ typedef struct _DECODER_PARAMETERS {
     int packedYCoCgRMode = 0;
     int logicalWidth = 0;
     int logicalHeight = 0;
+    bool adaptiveTileRefinement = false;
+    std::shared_ptr<AdaptiveTileInbox> refinementInbox;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
 
 #define WINDOW_STATE_CHANGE_SIZE 0x01

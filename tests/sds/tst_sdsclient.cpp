@@ -4,6 +4,7 @@
 #include "backend/sdsclient.h"
 #include "streaming/sds/filesanitize.h"
 #include "streaming/sds/fileclipboard.h"
+#include "streaming/video/adaptiverefinement_codec.h"
 #include "testutil.h"
 
 #include <QCryptographicHash>
@@ -13,6 +14,7 @@
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QSslServer>
 #include <QSslSocket>
 #include <QTemporaryDir>
 #include <QTest>
@@ -150,6 +152,7 @@ private slots:
     void lazyClipboardClientOfferAndChunkedPull();
     void lazyClipboardHostOfferAndDemandFetch();
     void unifiedDropsMultiFileAndFallback();
+    void tileRefinementLongPollOverPinnedMtls();
 
 private:
     bool startMock(const SdsTest::Identity& server, const SdsTest::Identity& trustedClient);
@@ -1310,6 +1313,174 @@ void TestSdsClient::unifiedDropsMultiFileAndFallback()
         return ev.type == ClientEvent::TransferFinished && ev.upload && ev.ok &&
                ev.message == QLatin1String("Saved note.txt to ~/Downloads/Moonlight");
     }));
+}
+
+void TestSdsClient::tileRefinementLongPollOverPinnedMtls()
+{
+    std::vector<std::uint8_t> rgb(64 * 64 * 3, 28);
+    rgb[(10 * 64 + 10) * 3 + 0] = 255;
+    rgb[(10 * 64 + 10) * 3 + 1] = 24;
+    rgb[(10 * 64 + 10) * 3 + 2] = 48;
+    std::vector<std::uint8_t> qoi;
+    QVERIFY(encodeQoiRgb24(rgb.data(), 64 * 3, 64, 64, qoi));
+
+    auto appendU16 = [](QByteArray& dst, std::uint16_t v) {
+        dst.append(static_cast<char>(v & 0xFFu));
+        dst.append(static_cast<char>((v >> 8) & 0xFFu));
+    };
+    auto appendU32 = [](QByteArray& dst, std::uint32_t v) {
+        dst.append(static_cast<char>(v & 0xFFu));
+        dst.append(static_cast<char>((v >> 8) & 0xFFu));
+        dst.append(static_cast<char>((v >> 16) & 0xFFu));
+        dst.append(static_cast<char>((v >> 24) & 0xFFu));
+    };
+
+    QByteArray batchBin;
+    batchBin.append("SDTR", 4);
+    appendU16(batchBin, AdaptiveRefinementWire::PROTOCOL_VERSION);
+    appendU16(batchBin, AdaptiveRefinementWire::FLAG_RESET_ALL);
+    appendU16(batchBin, 1920);
+    appendU16(batchBin, 1080);
+    appendU16(batchBin, 1);
+    appendU16(batchBin, 0);
+    appendU32(batchBin, 1);
+    appendU16(batchBin, 128);
+    appendU16(batchBin, 64);
+    appendU16(batchBin, 64);
+    appendU16(batchBin, 64);
+    appendU32(batchBin, static_cast<std::uint32_t>(qoi.size()));
+    batchBin.append(reinterpret_cast<const char*>(qoi.data()), static_cast<qsizetype>(qoi.size()));
+
+    QSslServer server;
+    QSslConfiguration sslCfg = QSslConfiguration::defaultConfiguration();
+    sslCfg.setLocalCertificate(m_ServerA.cert);
+    sslCfg.setPrivateKey(m_ServerA.key);
+    sslCfg.setCaCertificates({m_Client.cert});
+    sslCfg.setPeerVerifyMode(QSslSocket::VerifyPeer);
+    server.setSslConfiguration(sslCfg);
+    QObject::connect(&server, &QSslServer::sslErrors, &server, [&](QSslSocket* sock, const QList<QSslError>& errors) {
+        for (const QSslError& e : errors) {
+            if (e.error() == QSslError::SelfSignedCertificate || e.error() == QSslError::SelfSignedCertificateInChain) {
+                continue;
+            }
+            return;
+        }
+        sock->ignoreSslErrors();
+    });
+
+    int pollCount = 0;
+    QStringList seenPaths;
+    QSslCertificate seenPeerCert;
+    QObject::connect(&server, &QSslServer::pendingConnectionAvailable, &server, [&]() {
+        while (QTcpSocket* rawSock = server.nextPendingConnection()) {
+            auto* sslSock = qobject_cast<QSslSocket*>(rawSock);
+            QObject::connect(rawSock, &QTcpSocket::readyRead, rawSock, [&, rawSock, sslSock]() {
+                if (rawSock->property("replied").toBool()) {
+                    return;
+                }
+                const QByteArray req = rawSock->property("req").toByteArray() + rawSock->readAll();
+                if (!req.contains("\r\n\r\n")) {
+                    rawSock->setProperty("req", req);
+                    return;
+                }
+                rawSock->setProperty("replied", true);
+                if (sslSock) {
+                    seenPeerCert = sslSock->peerCertificate();
+                }
+                const QByteArray firstLine = req.left(req.indexOf("\r\n"));
+                seenPaths.append(QString::fromUtf8(firstLine));
+                ++pollCount;
+                if (pollCount == 1) {
+                    rawSock->write("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                } else if (pollCount == 2) {
+                    QByteArray hdr = QByteArrayLiteral("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ") +
+                                     QByteArray::number(batchBin.size()) +
+                                     QByteArrayLiteral("\r\nConnection: close\r\n\r\n");
+                    rawSock->write(hdr);
+                    rawSock->write(batchBin);
+                } else {
+                    rawSock->write("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+                rawSock->disconnectFromHost();
+            });
+            QObject::connect(rawSock, &QTcpSocket::disconnected, rawSock, &QObject::deleteLater);
+        }
+    });
+    QVERIFY(server.listen(QHostAddress::LocalHost));
+
+    // 1. Pinned server + valid paired client identity receives 204 -> 200 batch cleanly
+    auto inbox = std::make_shared<AdaptiveTileInbox>();
+    SdsClient::Config cfg;
+    cfg.host = QStringLiteral("127.0.0.1");
+    cfg.httpsPort = server.serverPort();
+    cfg.serverCert = m_ServerA.cert;
+    cfg.clientCert = m_Client.cert;
+    cfg.clientKey = m_Client.key;
+    cfg.longPollTimeoutSec = 2;
+    cfg.retryBaseMs = 100;
+    cfg.retryMaxMs = 500;
+
+    {
+        SdsTileRefinementClient client(cfg, inbox);
+        client.start();
+        QTRY_COMPARE_WITH_TIMEOUT(inbox->queuedTileCount(), std::size_t(1), 5000);
+        client.stop();
+    }
+
+    QVERIFY(pollCount >= 2);
+    QCOMPARE(seenPeerCert, m_Client.cert);
+    QVERIFY(seenPaths[0].startsWith(QStringLiteral("GET /sds/v1/tile-refinement?timeout=2")));
+
+    bool resetAll = false;
+    std::uint16_t fw = 0, fh = 0;
+    std::vector<AdaptiveDecodedTile> outTiles;
+    QVERIFY(inbox->takePending(resetAll, fw, fh, outTiles, RefinementColorspace::Rec601, true));
+    QVERIFY(resetAll);
+    QCOMPARE(fw, std::uint16_t(1920));
+    QCOMPARE(fh, std::uint16_t(1080));
+    QCOMPARE(outTiles.size(), std::size_t(1));
+    QCOMPARE(outTiles[0].x, std::uint16_t(128));
+    QCOMPARE(outTiles[0].y, std::uint16_t(64));
+    const auto* rgba = reinterpret_cast<const std::uint8_t*>(outTiles[0].rgba.constData());
+    QCOMPARE(rgba[(10 * 64 + 10) * 4 + 0], std::uint8_t(255));
+    QCOMPARE(rgba[(10 * 64 + 10) * 4 + 1], std::uint8_t(24));
+    QCOMPARE(rgba[(10 * 64 + 10) * 4 + 2], std::uint8_t(48));
+
+    // 2. Wrong pinned server cert must NOT receive any HTTP request or deliver any tiles
+    server.close();
+    int badHttpRequests = 0;
+    QSslServer badServer;
+    badServer.setSslConfiguration(sslCfg);
+    QObject::connect(&badServer, &QSslServer::sslErrors, &badServer, [&](QSslSocket* sock, const QList<QSslError>& errors) {
+        for (const QSslError& e : errors) {
+            if (e.error() == QSslError::SelfSignedCertificate || e.error() == QSslError::SelfSignedCertificateInChain) {
+                continue;
+            }
+            return;
+        }
+        sock->ignoreSslErrors();
+    });
+    QObject::connect(&badServer, &QSslServer::pendingConnectionAvailable, &badServer, [&]() {
+        while (QTcpSocket* rawSock = badServer.nextPendingConnection()) {
+            QObject::connect(rawSock, &QTcpSocket::readyRead, rawSock, [&]() {
+                ++badHttpRequests;
+            });
+            QObject::connect(rawSock, &QTcpSocket::disconnected, rawSock, &QObject::deleteLater);
+        }
+    });
+    QVERIFY(badServer.listen(QHostAddress::LocalHost));
+
+    auto badInbox = std::make_shared<AdaptiveTileInbox>();
+    cfg.httpsPort = badServer.serverPort();
+    cfg.serverCert = m_ServerB.cert;
+    {
+        SdsTileRefinementClient client(cfg, badInbox);
+        client.start();
+        QTest::qWait(400);
+        client.stop();
+    }
+    QCOMPARE(badInbox->queuedTileCount(), std::size_t(0));
+    QCOMPARE(badHttpRequests, 0);
 }
 
 int runSdsClientTests(int argc, char** argv)

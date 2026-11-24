@@ -19,6 +19,8 @@
 #include <memory>
 
 class SdsWorker;
+class SdsTileRefinementWorker;
+class AdaptiveTileInbox;
 
 class SdsClient : public Sds::IClient
 {
@@ -74,4 +76,25 @@ private:
     QMutex m_Lock;
     bool m_Started;
     bool m_Stopped;
+};
+
+class SdsTileRefinementClient
+{
+public:
+    SdsTileRefinementClient(const SdsClient::Config& config,
+                            std::shared_ptr<AdaptiveTileInbox> inbox);
+    ~SdsTileRefinementClient();
+
+    SdsTileRefinementClient(const SdsTileRefinementClient&) = delete;
+    SdsTileRefinementClient& operator=(const SdsTileRefinementClient&) = delete;
+
+    void start();
+    void stop();
+
+private:
+    QThread m_Thread;
+    SdsTileRefinementWorker* m_Worker;
+    QMutex m_Lock;
+    bool m_Started = false;
+    bool m_Stopped = false;
 };

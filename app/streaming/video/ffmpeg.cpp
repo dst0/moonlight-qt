@@ -246,6 +246,7 @@ FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
       m_PackedYCoCgRMode(0),
       m_LogicalWidth(0),
       m_LogicalHeight(0),
+      m_AdaptiveTileRefinement(false),
       m_VideoFormat(0),
       m_NeedsSpsFixup(false),
       m_TestOnly(testOnly),
@@ -503,6 +504,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     m_PackedYCoCgRMode = params->packedYCoCgRMode;
     m_LogicalWidth = params->logicalWidth;
     m_LogicalHeight = params->logicalHeight;
+    m_AdaptiveTileRefinement = params->adaptiveTileRefinement && (params->packedYCoCgRMode == 0);
     m_StreamFps = params->frameRate;
     m_VideoFormat = params->videoFormat;
     m_CurrentTestMode = testMode;
@@ -901,9 +903,11 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 ? m_LogicalHeight
                 : m_VideoDecoderCtx->height;
 
+            const char* adaptiveSuffix = m_AdaptiveTileRefinement ? " + Adaptive Tiles" : "";
+
             ret = snprintf(&output[offset],
                            length - offset,
-                           "Video stream: %dx%d %.2f FPS (Codec: %s)\n"
+                           "Video stream: %dx%d %.2f FPS (Codec: %s%s)\n"
 #ifdef DISPLAY_BITRATE
                            "Bitrate: %.1f Mbps, Peak (%us): %.1f\n"
 #endif
@@ -911,7 +915,8 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                            displayWidth,
                            displayHeight,
                            stats.totalFps,
-                           codecString
+                           codecString,
+                           adaptiveSuffix
 #ifdef DISPLAY_BITRATE
                            ,
                            avgVideoMbps,
@@ -1022,7 +1027,7 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef Q_OS_DARWIN
         case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
-            if (params->packedYCoCgRMode != 0) {
+            if (params->packedYCoCgRMode != 0 || params->adaptiveTileRefinement) {
                 if (params->renderer == StreamingPreferences::RS_VULKAN ||
                     params->renderer == StreamingPreferences::RS_AVSBDL) {
                     return nullptr;
@@ -1379,7 +1384,7 @@ bool FFmpegVideoDecoder::tryInitializeRendererForUnknownDecoder(const AVCodec* d
         }
     }
 
-    if (params->packedYCoCgRMode != 0) {
+    if (params->packedYCoCgRMode != 0 || params->adaptiveTileRefinement) {
 #ifdef Q_OS_DARWIN
         if (params->renderer == StreamingPreferences::RS_VULKAN ||
             params->renderer == StreamingPreferences::RS_AVSBDL) {

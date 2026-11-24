@@ -2024,6 +2024,15 @@ Flickable {
                     }
                 }
 
+                Label {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    font.pointSize: Math.max(8, Qt.application.font.pointSize - 1)
+                    color: "#8fbce6"
+                    visible: SystemProperties.isDarwin
+                    text: qsTr("Tip (\u24D8): For fast 4:2:0 motion with lossless RGB text in IDEs/desktops, enable Adaptive dirty-tile lossless refinement per PC via Right-Click -> Connection Settings... before connecting.")
+                }
+
                 CheckBox {
                     id: unlockBitrate
                     width: parent.width

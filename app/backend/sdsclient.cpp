@@ -5,6 +5,7 @@
 #include "streaming/sds/clipboardsync.h"
 #include "streaming/sds/filesanitize.h"
 #include "streaming/sds/fileclipboard.h"
+#include "streaming/video/adaptiverefinement_codec.h"
 
 #include <QCryptographicHash>
 #include <QDebug>
@@ -3150,4 +3151,256 @@ void SdsClient::sendDroppedFiles(double nx, double ny, const QStringList& paths)
 {
     SdsWorker* w = m_Worker;
     post([w, nx, ny, paths]() { w->doSendDroppedFiles(nx, ny, paths); });
+}
+
+class SdsTileRefinementWorker : public QObject
+{
+public:
+    SdsTileRefinementWorker(const SdsClient::Config& cfg,
+                            std::shared_ptr<AdaptiveTileInbox> inbox)
+        : m_Cfg(cfg),
+          m_Inbox(std::move(inbox))
+    {
+    }
+
+    void init()
+    {
+        if (m_Shutdown || !m_Inbox) {
+            return;
+        }
+        if (!LanPolicy::isPermittedConnectionTarget(QHostAddress(m_Cfg.host))) {
+            qWarning() << "Tile refinement blocked by LAN policy for host" << m_Cfg.host;
+            return;
+        }
+        if (m_Cfg.serverCert.isNull() || m_Cfg.httpsPort == 0 || m_Cfg.host.isEmpty()) {
+            qWarning() << "Tile refinement disabled: missing paired server cert/port";
+            return;
+        }
+
+        m_Nam = new QNetworkAccessManager(this);
+        m_Nam->setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+        m_Nam->setRedirectPolicy(QNetworkRequest::ManualRedirectPolicy);
+
+        m_SslConfig = QSslConfiguration::defaultConfiguration();
+        m_SslConfig.setLocalCertificate(m_Cfg.clientCert);
+        m_SslConfig.setPrivateKey(m_Cfg.clientKey);
+        m_SslConfig = CertPinning::restrictToPinned(m_SslConfig, m_Cfg.serverCert);
+        m_SslConfig.setPeerVerifyMode(QSslSocket::VerifyPeer);
+
+        startPoll();
+    }
+
+    void shutdown()
+    {
+        m_Shutdown = true;
+        if (m_RetryTimer) {
+            m_RetryTimer->stop();
+        }
+        if (m_ActiveReply) {
+            m_ActiveReply->abort();
+            m_ActiveReply = nullptr;
+        }
+    }
+
+private:
+    void startPoll()
+    {
+        if (m_Shutdown || !m_Nam || m_ActiveReply) {
+            return;
+        }
+
+        const int timeoutSec = qBound(0, m_Cfg.longPollTimeoutSec, 25);
+        QUrl url;
+        url.setScheme(QStringLiteral("https"));
+        url.setHost(m_Cfg.host);
+        url.setPort(m_Cfg.httpsPort);
+        url.setPath(QStringLiteral("/sds/v1/tile-refinement"));
+        QUrlQuery q;
+        q.addQueryItem(QStringLiteral("timeout"), QString::number(timeoutSec));
+        url.setQuery(q);
+
+        QNetworkRequest req(url);
+        req.setSslConfiguration(m_SslConfig);
+        req.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+        req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+        req.setAttribute(QNetworkRequest::CacheLoadControlAttribute, QNetworkRequest::AlwaysNetwork);
+        req.setAttribute(QNetworkRequest::CacheSaveControlAttribute, false);
+        req.setAttribute(QNetworkRequest::CookieLoadControlAttribute, QNetworkRequest::Manual);
+        req.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
+        req.setHeader(QNetworkRequest::UserAgentHeader, QByteArrayLiteral("Moonlight-SDS/1"));
+        req.setTransferTimeout((timeoutSec + 10) * 1000);
+
+        QNetworkReply* reply = m_Nam->get(req);
+        m_ActiveReply = reply;
+        CertPinning::enforce(reply, m_Cfg.serverCert);
+
+        constexpr qint64 maxBytes = AdaptiveRefinementWire::MAX_BATCH_BYTES;
+        reply->setReadBufferSize(maxBytes + 1);
+        connect(reply, &QIODevice::readyRead, this, [reply]() {
+            if (reply->bytesAvailable() > AdaptiveRefinementWire::MAX_BATCH_BYTES) {
+                reply->setProperty(kTooLargeProp, true);
+                reply->abort();
+            }
+        });
+        connect(reply, &QNetworkReply::downloadProgress, this, [reply](qint64 received, qint64 total) {
+            if (received > AdaptiveRefinementWire::MAX_BATCH_BYTES || total > AdaptiveRefinementWire::MAX_BATCH_BYTES) {
+                reply->setProperty(kTooLargeProp, true);
+                reply->abort();
+            }
+        });
+        connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+            handlePollFinished(reply);
+        });
+    }
+
+    void scheduleRetry(int delayMs)
+    {
+        if (m_Shutdown) {
+            return;
+        }
+        if (!m_RetryTimer) {
+            m_RetryTimer = new QTimer(this);
+            m_RetryTimer->setSingleShot(true);
+            connect(m_RetryTimer, &QTimer::timeout, this, [this]() {
+                startPoll();
+            });
+        }
+        m_RetryTimer->start(qMax(0, delayMs));
+    }
+
+    void handlePollFinished(QNetworkReply* reply)
+    {
+        if (m_ActiveReply == reply) {
+            m_ActiveReply = nullptr;
+        }
+        reply->deleteLater();
+
+        if (m_Shutdown) {
+            return;
+        }
+
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const bool tooLarge = reply->property(kTooLargeProp).toBool();
+
+        if (tooLarge) {
+            qWarning() << "Tile refinement batch exceeded max size";
+            scheduleRetry(m_Cfg.retryBaseMs);
+            return;
+        }
+
+        if (status == 401 || status == 403 || status == 404 ||
+            reply->error() == QNetworkReply::SslHandshakeFailedError) {
+            qInfo() << "Tile refinement stopped (status" << status << ", error" << reply->error() << ")";
+            return;
+        }
+
+        if (reply->error() != QNetworkReply::NoError && status != 200 && status != 204) {
+            const int delay = qBound(250, m_BackoffMs, qMax(250, m_Cfg.retryMaxMs));
+            m_BackoffMs = qMin(m_BackoffMs * 2, qMax(250, m_Cfg.retryMaxMs));
+            scheduleRetry(delay);
+            return;
+        }
+
+        if (status == 204) {
+            m_BackoffMs = qMax(250, m_Cfg.retryBaseMs);
+            scheduleRetry(0);
+            return;
+        }
+
+        if (status == 200) {
+            const QString contentType = reply->header(QNetworkRequest::ContentTypeHeader).toString().section(QLatin1Char(';'), 0, 0).trimmed().toLower();
+            if (!contentType.isEmpty() && contentType != QLatin1String("application/octet-stream")) {
+                qWarning() << "Unexpected tile refinement Content-Type:" << contentType;
+                scheduleRetry(m_Cfg.retryBaseMs);
+                return;
+            }
+            const QByteArray body = reply->readAll();
+            RefinementColorspace cs = RefinementColorspace::Rec601;
+            bool fullRange = true;
+            m_Inbox->colorimetry(cs, fullRange);
+
+            AdaptiveTileBatch batch;
+            if (parseTileRefinementBatch(body, cs, fullRange, batch)) {
+                m_Inbox->pushBatch(std::move(batch));
+                m_BackoffMs = qMax(250, m_Cfg.retryBaseMs);
+                scheduleRetry(0);
+            } else {
+                qWarning() << "Rejected malformed tile refinement batch (" << body.size() << "bytes)";
+                scheduleRetry(m_Cfg.retryBaseMs);
+            }
+            return;
+        }
+
+        const int delay = qBound(250, m_BackoffMs, qMax(250, m_Cfg.retryMaxMs));
+        m_BackoffMs = qMin(m_BackoffMs * 2, qMax(250, m_Cfg.retryMaxMs));
+        scheduleRetry(delay);
+    }
+
+    SdsClient::Config m_Cfg;
+    std::shared_ptr<AdaptiveTileInbox> m_Inbox;
+    QNetworkAccessManager* m_Nam = nullptr;
+    QSslConfiguration m_SslConfig;
+    QPointer<QNetworkReply> m_ActiveReply;
+    QTimer* m_RetryTimer = nullptr;
+    bool m_Shutdown = false;
+    int m_BackoffMs = 250;
+};
+
+SdsTileRefinementClient::SdsTileRefinementClient(const SdsClient::Config& config,
+                                                 std::shared_ptr<AdaptiveTileInbox> inbox)
+    : m_Worker(new SdsTileRefinementWorker(config, std::move(inbox)))
+{
+    m_Thread.setObjectName(QStringLiteral("SdsTileRefinement"));
+}
+
+SdsTileRefinementClient::~SdsTileRefinementClient()
+{
+    stop();
+    if (!m_Started && m_Worker) {
+        delete m_Worker;
+        m_Worker = nullptr;
+    }
+}
+
+void SdsTileRefinementClient::start()
+{
+    {
+        QMutexLocker lock(&m_Lock);
+        if (m_Started || m_Stopped) {
+            return;
+        }
+        m_Started = true;
+    }
+
+    m_Worker->moveToThread(&m_Thread);
+    QObject::connect(&m_Thread, &QThread::finished, m_Worker, &QObject::deleteLater);
+    m_Thread.start();
+
+    SdsTileRefinementWorker* w = m_Worker;
+    QMetaObject::invokeMethod(w, [w]() { w->init(); }, Qt::QueuedConnection);
+}
+
+void SdsTileRefinementClient::stop()
+{
+    {
+        QMutexLocker lock(&m_Lock);
+        if (m_Stopped) {
+            return;
+        }
+        m_Stopped = true;
+        if (!m_Started) {
+            return;
+        }
+    }
+
+    SdsTileRefinementWorker* w = m_Worker;
+    if (QThread::currentThread() == &m_Thread) {
+        QMetaObject::invokeMethod(w, [w]() { w->shutdown(); }, Qt::QueuedConnection);
+        m_Thread.quit();
+        return;
+    }
+    QMetaObject::invokeMethod(w, [w]() { w->shutdown(); }, Qt::BlockingQueuedConnection);
+    m_Thread.quit();
+    m_Thread.wait();
+    m_Worker = nullptr;
 }

@@ -31,7 +31,8 @@ SOURCES += \
     $$APP_DIR/streaming/sds/clipboardsync.cpp \
     $$APP_DIR/streaming/sds/fileclipboard.cpp \
     $$APP_DIR/streaming/sds/filesanitize.cpp \
-    $$APP_DIR/streaming/sds/sdscontroller.cpp
+    $$APP_DIR/streaming/sds/sdscontroller.cpp \
+    $$APP_DIR/streaming/video/adaptiverefinement_codec.cpp
 
 HEADERS += \
     testutil.h \
@@ -41,7 +42,8 @@ HEADERS += \
     $$APP_DIR/streaming/sds/fileclipboard.h \
     $$APP_DIR/streaming/sds/filesanitize.h \
     $$APP_DIR/streaming/sds/sdscontroller.h \
-    $$APP_DIR/streaming/sds/sdstypes.h
+    $$APP_DIR/streaming/sds/sdstypes.h \
+    $$APP_DIR/streaming/video/adaptiverefinement_codec.h
 
 macx {
     SOURCES += $$APP_DIR/streaming/sds/clipboard_mac.mm pasteboard_helper.mm

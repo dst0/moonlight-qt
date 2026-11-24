@@ -242,7 +242,7 @@ private slots:
             "<ServerCodecModeSupport>65793</ServerCodecModeSupport>"
             "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"
             "<sdsVersion>1</sdsVersion>"
-            "<sdsFeatures>clipboard,files,file_clipboard,lazy_clipboard,xdnd_drop,host_encoder,host_capture_adapter,host_resolution</sdsFeatures>"
+            "<sdsFeatures>clipboard,files,file_clipboard,lazy_clipboard,xdnd_drop,host_encoder,host_capture_adapter,host_resolution,adaptive_tile_refinement</sdsFeatures>"
             "<sdsEncoders>vaapi,vulkan,software</sdsEncoders>"
             "<sdsSoftwareCodecModeSupport>786689</sdsSoftwareCodecModeSupport>"
             "<sdsAdapters>"
@@ -257,6 +257,7 @@ private slots:
         QVERIFY(pc.hasSdsFeature(QStringLiteral("host_encoder")));
         QVERIFY(pc.hasSdsFeature(QStringLiteral("host_capture_adapter")));
         QVERIFY(pc.hasSdsFeature(QStringLiteral("host_resolution")));
+        QVERIFY(pc.hasSdsFeature(QStringLiteral("adaptive_tile_refinement")));
         QVERIFY(pc.hasSdsFeature(QStringLiteral("lazy_clipboard")));
         QVERIFY(pc.hasSdsFeature(QStringLiteral("xdnd_drop")));
         QCOMPARE(pc.sdsEncoders, (QStringList{QStringLiteral("vaapi"), QStringLiteral("vulkan"), QStringLiteral("software")}));
@@ -394,6 +395,15 @@ private slots:
         QCOMPARE(capturedRequests.size(), 2);
         QVERIFY(capturedRequests[1].contains(QStringLiteral("hdrMode=1")));
         QVERIFY(!capturedRequests[1].contains(QStringLiteral("sdsChromaMode")));
+        QVERIFY(!capturedRequests[1].contains(QStringLiteral("sdsTileRefinement")));
+
+        // Adaptive tile refinement sends sdsTileRefinement=1 and suppresses hdrMode=1
+        http.startApp(QStringLiteral("launch"), false, 1, &cfg, false, false, 0, false,
+                      rtspUrl, QString(), QString(), true);
+        QCOMPARE(capturedRequests.size(), 3);
+        QVERIFY(capturedRequests[2].contains(QStringLiteral("sdsTileRefinement=1")));
+        QVERIFY(!capturedRequests[2].contains(QStringLiteral("hdrMode=1")));
+        QVERIFY(!capturedRequests[2].contains(QStringLiteral("sdsChromaMode")));
     }
 
 private:

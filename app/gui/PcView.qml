@@ -250,6 +250,17 @@ CenteredGridView {
                         hostCaptureAdapterDialog.open()
                     }
                 }
+                NavigableMenuItem {
+                    visible: model.paired
+                    text: qsTr("Connection Settings...")
+                    onTriggered: {
+                        connectionSettingsDialog.pcIndex = index
+                        connectionSettingsDialog.pcName = model.name
+                        connectionSettingsDialog.supportsAdaptiveRefinement = model.supportsAdaptiveTileRefinement
+                        connectionSettingsDialog.adaptiveRefinementEnabled = model.adaptiveTileRefinementEnabled
+                        connectionSettingsDialog.open()
+                    }
+                }
             }
         }
 
@@ -448,6 +459,113 @@ CenteredGridView {
                     text: modelData.isCaptureDefault ? qsTr("%1 (Active X11)").arg(modelData.name) : modelData.name
                     checked: hostCaptureAdapterDialog.selectedAdapterId === modelData.id
                     onClicked: hostCaptureAdapterDialog.selectedAdapterId = modelData.id
+                }
+            }
+        }
+    }
+
+    NavigableDialog {
+        id: connectionSettingsDialog
+        property int pcIndex: -1
+        property string pcName: ""
+        property bool supportsAdaptiveRefinement: false
+        property bool adaptiveRefinementEnabled: false
+        width: 480
+        standardButtons: Dialog.Ok | Dialog.Cancel
+
+        onAccepted: {
+            if (pcIndex >= 0) {
+                computerModel.setAdaptiveTileRefinement(pcIndex, adaptiveRefinementCheck.checked)
+            }
+        }
+
+        ColumnLayout {
+            width: connectionSettingsDialog.availableWidth
+            spacing: 10
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("Connection Settings (%1)").arg(connectionSettingsDialog.pcName)
+                font.bold: true
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                CheckBox {
+                    id: adaptiveRefinementCheck
+                    Layout.fillWidth: true
+                    text: qsTr("Adaptive dirty-tile lossless refinement")
+                    checked: connectionSettingsDialog.adaptiveRefinementEnabled
+                    onToggled: connectionSettingsDialog.adaptiveRefinementEnabled = checked
+
+                    ToolTip.delay: 150
+                    ToolTip.timeout: 12000
+                    ToolTip.visible: hovered || adaptiveInfoHover.containsMouse
+                    ToolTip.text: qsTr("Streams fast native 4:2:0 video for maximum FPS and low latency in games/video, and sends lossless RGB over paired mTLS ONLY for settled 64x64 text/UI tiles with a GPU zero-ghosting check (|Y_video - Y_ref| <= eps).\n\nTurn ON for IDE, terminal, code editor, or desktop work.\nTurn OFF for pure gaming or full-screen video playback.")
+                }
+
+                Rectangle {
+                    width: 20
+                    height: 20
+                    radius: 10
+                    color: adaptiveInfoHover.containsMouse ? "#2f4f6f" : "transparent"
+                    border.width: 1
+                    border.color: "#8fbce6"
+
+                    Label {
+                        anchors.centerIn: parent
+                        text: "\u24D8"
+                        color: "#8fbce6"
+                        font.bold: true
+                        font.pointSize: Math.max(9, Qt.application.font.pointSize)
+                    }
+
+                    MouseArea {
+                        id: adaptiveInfoHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                    }
+                }
+            }
+
+            Label {
+                readonly property bool badRenderer: SystemProperties.isDarwin &&
+                                                    StreamingPreferences.rendererSelection !== StreamingPreferences.RS_AUTO &&
+                                                    StreamingPreferences.rendererSelection !== StreamingPreferences.RS_METAL
+                readonly property bool hasConflict: adaptiveRefinementCheck.checked && (
+                    !SystemProperties.isDarwin ||
+                    !connectionSettingsDialog.supportsAdaptiveRefinement ||
+                    StreamingPreferences.enableHdr ||
+                    badRenderer
+                )
+
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                font.pointSize: Math.max(8, Qt.application.font.pointSize - 1)
+                color: hasConflict ? "#ffcc66" : (adaptiveRefinementCheck.checked && StreamingPreferences.enableYUV444 ? "#8fbce6" : "#a8b3bd")
+                text: {
+                    if (!adaptiveRefinementCheck.checked) {
+                        return qsTr("Off by default for pure 4:2:0 gaming speed. Enable per PC for razor-sharp RGB text tiles over Metal.")
+                    }
+                    if (!SystemProperties.isDarwin) {
+                        return qsTr("Conflict: Adaptive dirty-tile lossless refinement requires the macOS Metal renderer.")
+                    }
+                    if (!connectionSettingsDialog.supportsAdaptiveRefinement) {
+                        return qsTr("Conflict: This host does not currently advertise adaptive_tile_refinement.")
+                    }
+                    if (StreamingPreferences.enableHdr) {
+                        return qsTr("Conflict: HDR is enabled in global Settings. Turn off HDR to use adaptive dirty-tile refinement (HDR takes precedence).")
+                    }
+                    if (badRenderer) {
+                        return qsTr("Conflict: A non-Metal renderer is selected in global Settings. Switch Video Renderer to Automatic or Metal to activate adaptive tile refinement.")
+                    }
+                    if (StreamingPreferences.enableYUV444) {
+                        return qsTr("Note: 4:4:4 override is suppressed for this PC so motion uses fast 4:2:0 while static 64x64 text/UI tiles stay lossless RGB.")
+                    }
+                    return qsTr("Active: Streams native 4:2:0 with mTLS lossless QOI-RGB24 refinement on settled 64x64 text/UI tiles.")
                 }
             }
         }

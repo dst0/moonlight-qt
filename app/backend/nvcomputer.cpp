@@ -258,7 +258,8 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
             QString f = feature.trimmed().toLower();
             if ((f == "clipboard" || f == "files" || f == "mic" || f == "file_clipboard" ||
                  f == "host_encoder" || f == "host_capture_adapter" || f == "host_resolution" ||
-                 f == "lazy_clipboard" || f == "xdnd_drop" || f == "hw_ycocgr_444") &&
+                 f == "lazy_clipboard" || f == "xdnd_drop" || f == "hw_ycocgr_444" ||
+                 f == "adaptive_tile_refinement") &&
                 !this->sdsFeatures.contains(f)) {
                 this->sdsFeatures.append(f);
             }

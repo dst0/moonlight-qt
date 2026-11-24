@@ -129,6 +129,7 @@ private:
     int m_PackedYCoCgRMode;
     int m_LogicalWidth;
     int m_LogicalHeight;
+    bool m_AdaptiveTileRefinement;
     int m_VideoFormat;
     bool m_NeedsSpsFixup;
     bool m_TestOnly;

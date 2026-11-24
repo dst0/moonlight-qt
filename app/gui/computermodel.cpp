@@ -77,6 +77,16 @@ QVariant ComputerModel::data(const QModelIndex& index, int role) const
                 ? prefs->hostCaptureAdapterOverride(fp)
                 : prefs->hostAdapterOverride(fp);
     }
+    case SupportsAdaptiveTileRefinementRole:
+        return computer->pairState == NvComputer::PS_PAIRED &&
+               computer->hasSdsFeature(QStringLiteral("adaptive_tile_refinement"));
+    case AdaptiveTileRefinementEnabledRole: {
+        if (computer->serverCert.isNull() || computer->pairState != NvComputer::PS_PAIRED) {
+            return false;
+        }
+        QString fp = QString::fromLatin1(computer->serverCert.digest(QCryptographicHash::Sha256).toHex());
+        return StreamingPreferences::get()->adaptiveRefinementForHost(fp);
+    }
     case DetailsRole: {
         QString state, pairState;
 
@@ -151,6 +161,8 @@ QHash<int, QByteArray> ComputerModel::roleNames() const
     names[SelectedAdapterIdRole] = "selectedAdapterId";
     names[HasHostCaptureAdapterRole] = "hasHostCaptureAdapter";
     names[SelectedCaptureAdapterIdRole] = "selectedCaptureAdapterId";
+    names[SupportsAdaptiveTileRefinementRole] = "supportsAdaptiveTileRefinement";
+    names[AdaptiveTileRefinementEnabledRole] = "adaptiveTileRefinementEnabled";
 
     return names;
 }
@@ -186,6 +198,18 @@ void ComputerModel::setHostCaptureAdapter(int computerIndex, QString adapterId)
     prefs->setHostCaptureAdapterOverride(fingerprint, adapterId);
     prefs->save();
     emit dataChanged(index(computerIndex), index(computerIndex), {SelectedCaptureAdapterIdRole});
+}
+
+void ComputerModel::setAdaptiveTileRefinement(int computerIndex, bool enabled)
+{
+    const auto fingerprint = fileClipboardFingerprint(computerIndex);
+    if (fingerprint.isEmpty()) {
+        return;
+    }
+    auto prefs = StreamingPreferences::get();
+    prefs->setAdaptiveRefinementForHost(fingerprint, enabled);
+    prefs->save();
+    emit dataChanged(index(computerIndex), index(computerIndex), {AdaptiveTileRefinementEnabledRole});
 }
 
 bool ComputerModel::setFileClipboardApproval(int computerIndex, QString expectedFingerprint, bool approved)

@@ -200,6 +200,8 @@ SOURCES += \
     gui/appmodel.cpp \
     streaming/bandwidth.cpp \
     streaming/streamutils.cpp \
+    streaming/video/adaptiverefinement.cpp \
+    streaming/video/adaptiverefinement_codec.cpp \
     streaming/video/packed444.cpp \
     path.cpp \
     settings/mappingmanager.cpp \
@@ -237,6 +239,8 @@ HEADERS += \
     gui/computermodel.h \
     gui/appmodel.h \
     streaming/video/decoder.h \
+    streaming/video/adaptiverefinement.h \
+    streaming/video/adaptiverefinement_codec.h \
     streaming/video/packed444.h \
     streaming/bandwidth.h \
     streaming/streamutils.h \

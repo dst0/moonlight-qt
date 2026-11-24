@@ -127,6 +127,32 @@ private slots:
         QVERIFY(!prefs->matchHostResolution);
         QVERIFY(prefs->revertHostResolution);
         QVERIFY(!prefs->effectiveRevertHostResolution());
+
+        // Per-PC adaptive dirty-tile refinement defaults false, persists keyed by cert fingerprint
+        QSignalSpy adaptiveSpy(prefs, &StreamingPreferences::hostAdaptiveRefinementChanged);
+        QVERIFY(!prefs->adaptiveRefinementForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(!prefs->adaptiveRefinementForHost(QString()));
+
+        prefs->setAdaptiveRefinementForHost(QString(), true);
+        QCOMPARE(adaptiveSpy.count(), 0);
+        prefs->setAdaptiveRefinementForHost(QStringLiteral("fp_host_a"), true);
+        QCOMPARE(adaptiveSpy.count(), 1);
+        QVERIFY(prefs->adaptiveRefinementForHost(QStringLiteral("fp_host_a")));
+        prefs->save();
+
+        prefs->setAdaptiveRefinementForHost(QStringLiteral("fp_host_a"), false);
+        QCOMPARE(adaptiveSpy.count(), 2);
+        QVERIFY(!prefs->adaptiveRefinementForHost(QStringLiteral("fp_host_a")));
+        prefs->reload();
+        QVERIFY(prefs->adaptiveRefinementForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(!prefs->adaptiveRefinementForHost(QStringLiteral("fp_other")));
+
+        // Clearing removes the map entry cleanly
+        prefs->setAdaptiveRefinementForHost(QStringLiteral("fp_host_a"), false);
+        QVERIFY(!prefs->hostAdaptiveRefinement.contains(QStringLiteral("fp_host_a")));
+        prefs->save();
+        prefs->reload();
+        QVERIFY(!prefs->adaptiveRefinementForHost(QStringLiteral("fp_host_a")));
     }
 
 private:

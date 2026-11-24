@@ -27,6 +27,46 @@ struct Packed444Params
 };
 
 constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+constexpr sampler s_ref(coord::normalized, address::clamp_to_edge, filter::nearest);
+
+struct RefinementParams
+{
+    float yTol;
+    uint enabled;
+    uint2 logicalSize;
+};
+
+inline half4 applyTileRefinement(Vertex v,
+                                 half4 videoColor,
+                                 constant CscParams &cscParams,
+                                 constant RefinementParams &refParams,
+                                 texture2d<half> luminancePlane,
+                                 texture2d<half> refTex,
+                                 texture2d<half> maskTex)
+{
+    if (refParams.enabled == 0u ||
+        refParams.logicalSize.x == 0u ||
+        refParams.logicalSize.y == 0u ||
+        maskTex.get_width() == 0u ||
+        maskTex.get_height() == 0u) {
+        return videoColor;
+    }
+
+    float2 normCoord = clamp(v.texCoords, float2(0.0f), float2(0.999999f));
+    uint2 px = min(uint2(normCoord * float2(refParams.logicalSize)), refParams.logicalSize - 1u);
+    uint2 tileCoord = min(px / 64u, uint2(maskTex.get_width() - 1u, maskTex.get_height() - 1u));
+    if (maskTex.read(tileCoord).r < 0.5h) {
+        return videoColor;
+    }
+
+    half4 refSample = refTex.read(px);
+    float yVideo = float(luminancePlane.sample(s_ref, normCoord).r) * float(cscParams.bitnessScaleFactor);
+    float yRef = float(refSample.a);
+    if (abs(yVideo - yRef) <= refParams.yTol) {
+        return half4(refSample.rgb, 1.0h);
+    }
+    return videoColor;
+}
 
 inline int floorDiv2(int v)
 {
@@ -64,19 +104,56 @@ vertex Vertex vs_draw(constant Vertex *vertices [[ buffer(0) ]], uint id [[ vert
     return vertices[id];
 }
 
+inline half4 sampleBiplanarColor(float2 texCoords,
+                                 constant CscParams &cscParams,
+                                 texture2d<half> luminancePlane,
+                                 texture2d<half> chrominancePlane)
+{
+    float2 chromaOffset = float2(cscParams.chromaOffset) / float2(luminancePlane.get_width(),
+                                                                  luminancePlane.get_height());
+    half3 yuv = half3(luminancePlane.sample(s, texCoords).r,
+                      chrominancePlane.sample(s, texCoords + chromaOffset).rg);
+    yuv *= cscParams.bitnessScaleFactor;
+    yuv -= cscParams.offsets;
+
+    return half4(yuv * cscParams.matrix, 1.0h);
+}
+
+inline half4 sampleTriplanarColor(float2 texCoords,
+                                  constant CscParams &cscParams,
+                                  texture2d<half> luminancePlane,
+                                  texture2d<half> chrominancePlaneU,
+                                  texture2d<half> chrominancePlaneV)
+{
+    float2 chromaOffset = float2(cscParams.chromaOffset) / float2(luminancePlane.get_width(),
+                                                                  luminancePlane.get_height());
+    half3 yuv = half3(luminancePlane.sample(s, texCoords).r,
+                      chrominancePlaneU.sample(s, texCoords + chromaOffset).r,
+                      chrominancePlaneV.sample(s, texCoords + chromaOffset).r);
+    yuv *= cscParams.bitnessScaleFactor;
+    yuv -= cscParams.offsets;
+
+    return half4(yuv * cscParams.matrix, 1.0h);
+}
+
 fragment half4 ps_draw_biplanar(Vertex v [[ stage_in ]],
                                 constant CscParams &cscParams [[ buffer(0) ]],
                                 texture2d<half> luminancePlane [[ texture(0) ]],
                                 texture2d<half> chrominancePlane [[ texture(1) ]])
 {
-    float2 chromaOffset = float2(cscParams.chromaOffset) / float2(luminancePlane.get_width(),
-                                                                  luminancePlane.get_height());
-    half3 yuv = half3(luminancePlane.sample(s, v.texCoords).r,
-                      chrominancePlane.sample(s, v.texCoords + chromaOffset).rg);
-    yuv *= cscParams.bitnessScaleFactor;
-    yuv -= cscParams.offsets;
+    return sampleBiplanarColor(v.texCoords, cscParams, luminancePlane, chrominancePlane);
+}
 
-    return half4(yuv * cscParams.matrix, 1.0h);
+fragment half4 ps_draw_biplanar_refined(Vertex v [[ stage_in ]],
+                                        constant CscParams &cscParams [[ buffer(0) ]],
+                                        constant RefinementParams &refParams [[ buffer(1) ]],
+                                        texture2d<half> luminancePlane [[ texture(0) ]],
+                                        texture2d<half> chrominancePlane [[ texture(1) ]],
+                                        texture2d<half> refTex [[ texture(2) ]],
+                                        texture2d<half> maskTex [[ texture(3) ]])
+{
+    half4 baseColor = sampleBiplanarColor(v.texCoords, cscParams, luminancePlane, chrominancePlane);
+    return applyTileRefinement(v, baseColor, cscParams, refParams, luminancePlane, refTex, maskTex);
 }
 
 fragment half4 ps_draw_triplanar(Vertex v [[ stage_in ]],
@@ -85,15 +162,20 @@ fragment half4 ps_draw_triplanar(Vertex v [[ stage_in ]],
                                  texture2d<half> chrominancePlaneU [[ texture(1) ]],
                                  texture2d<half> chrominancePlaneV [[ texture(2) ]])
 {
-    float2 chromaOffset = float2(cscParams.chromaOffset) / float2(luminancePlane.get_width(),
-                                                                  luminancePlane.get_height());
-    half3 yuv = half3(luminancePlane.sample(s, v.texCoords).r,
-                      chrominancePlaneU.sample(s, v.texCoords + chromaOffset).r,
-                      chrominancePlaneV.sample(s, v.texCoords + chromaOffset).r);
-    yuv *= cscParams.bitnessScaleFactor;
-    yuv -= cscParams.offsets;
+    return sampleTriplanarColor(v.texCoords, cscParams, luminancePlane, chrominancePlaneU, chrominancePlaneV);
+}
 
-    return half4(yuv * cscParams.matrix, 1.0h);
+fragment half4 ps_draw_triplanar_refined(Vertex v [[ stage_in ]],
+                                         constant CscParams &cscParams [[ buffer(0) ]],
+                                         constant RefinementParams &refParams [[ buffer(1) ]],
+                                         texture2d<half> luminancePlane [[ texture(0) ]],
+                                         texture2d<half> chrominancePlaneU [[ texture(1) ]],
+                                         texture2d<half> chrominancePlaneV [[ texture(2) ]],
+                                         texture2d<half> refTex [[ texture(3) ]],
+                                         texture2d<half> maskTex [[ texture(4) ]])
+{
+    half4 baseColor = sampleTriplanarColor(v.texCoords, cscParams, luminancePlane, chrominancePlaneU, chrominancePlaneV);
+    return applyTileRefinement(v, baseColor, cscParams, refParams, luminancePlane, refTex, maskTex);
 }
 
 fragment half4 ps_draw_rgb(Vertex v [[ stage_in ]],

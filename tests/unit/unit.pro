@@ -31,6 +31,7 @@ SOURCES += \
     tst_sourcepolicy.cpp \
     tst_nvhttp.cpp \
     tst_preferences.cpp \
+    test_adaptiverefinement.cpp \
     test_packed444.cpp \
     $$APP_DIR/backend/boxartmanager.cpp \
     $$APP_DIR/backend/nvcomputer.cpp \
@@ -43,6 +44,8 @@ SOURCES += \
     $$APP_DIR/settings/streamingpreferences.cpp \
     $$APP_DIR/path.cpp \
     $$APP_DIR/streaming/input/keymapping.cpp \
+    $$APP_DIR/streaming/video/adaptiverefinement.cpp \
+    $$APP_DIR/streaming/video/adaptiverefinement_codec.cpp \
     $$APP_DIR/streaming/video/packed444.cpp
 
 HEADERS += \
@@ -50,13 +53,17 @@ HEADERS += \
     $$APP_DIR/backend/nvcomputer.h \
     $$APP_DIR/backend/nvhttp.h \
     $$APP_DIR/settings/streamingpreferences.h \
+    $$APP_DIR/streaming/video/adaptiverefinement.h \
+    $$APP_DIR/streaming/video/adaptiverefinement_codec.h \
     $$APP_DIR/streaming/video/packed444.h
 
 macx {
     HEADERS += \
+        test_metal_refinement.h \
         test_metal_ycocgr.h
     SOURCES += \
         tst_keychain.cpp \
+        test_metal_refinement.mm \
         test_metal_ycocgr.mm \
         $$APP_DIR/backend/keychain_mac.cpp
     LIBS += -framework Security -framework CoreFoundation -framework Metal -framework Foundation

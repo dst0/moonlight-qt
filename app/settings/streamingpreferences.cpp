@@ -66,6 +66,7 @@
 #define SER_SDSHOSTENCODER "sdshostencoder"
 #define SER_SDSHOSTADAPTERS "sdshostadapters"
 #define SER_SDSHOSTCAPTUREADAPTERS "sdshostcaptureadapters"
+#define SER_SDSHOSTADAPTIVEREFINEMENT "sdshostadaptiverefinement"
 #define SER_SDSMATCHHOSTRES "sdsmatchhostres"
 #define SER_SDSREVERTHOSTRES "sdsreverthostres"
 
@@ -205,6 +206,7 @@ void StreamingPreferences::reload()
     hostEncoderConfig = static_cast<HostEncoderConfig>(rawHostEnc);
     hostAdapterOverrides = settings.value(SER_SDSHOSTADAPTERS, QVariantMap()).toMap();
     hostCaptureAdapterOverrides = settings.value(SER_SDSHOSTCAPTUREADAPTERS, QVariantMap()).toMap();
+    hostAdaptiveRefinement = settings.value(SER_SDSHOSTADAPTIVEREFINEMENT, QVariantMap()).toMap();
     matchHostResolution = settings.value(SER_SDSMATCHHOSTRES, false).toBool();
     revertHostResolution = settings.value(SER_SDSREVERTHOSTRES, false).toBool();
 
@@ -412,6 +414,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_SDSHOSTENCODER, static_cast<int>(hostEncoderConfig));
     settings.setValue(SER_SDSHOSTADAPTERS, hostAdapterOverrides);
     settings.setValue(SER_SDSHOSTCAPTUREADAPTERS, hostCaptureAdapterOverrides);
+    settings.setValue(SER_SDSHOSTADAPTIVEREFINEMENT, hostAdaptiveRefinement);
     settings.setValue(SER_SDSMATCHHOSTRES, matchHostResolution);
     settings.setValue(SER_SDSREVERTHOSTRES, revertHostResolution);
 }
@@ -468,6 +471,34 @@ void StreamingPreferences::setHostCaptureAdapterOverride(const QString& fingerpr
     if (updatePerHostOverride(hostCaptureAdapterOverrides, fingerprint, adapterId)) {
         emit hostCaptureAdapterOverridesChanged();
     }
+}
+
+bool StreamingPreferences::adaptiveRefinementForHost(const QString& fingerprint) const
+{
+    if (fingerprint.isEmpty()) {
+        return false;
+    }
+    return hostAdaptiveRefinement.value(fingerprint, false).toBool();
+}
+
+void StreamingPreferences::setAdaptiveRefinementForHost(const QString& fingerprint, bool enabled)
+{
+    if (fingerprint.isEmpty()) {
+        return;
+    }
+    if (!enabled) {
+        if (!hostAdaptiveRefinement.contains(fingerprint)) {
+            return;
+        }
+        hostAdaptiveRefinement.remove(fingerprint);
+        emit hostAdaptiveRefinementChanged();
+        return;
+    }
+    if (hostAdaptiveRefinement.value(fingerprint, false).toBool()) {
+        return;
+    }
+    hostAdaptiveRefinement.insert(fingerprint, true);
+    emit hostAdaptiveRefinementChanged();
 }
 
 void StreamingPreferences::requestMicrophonePermission()

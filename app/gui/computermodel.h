@@ -22,7 +22,9 @@ class ComputerModel : public QAbstractListModel
         AdaptersRole,
         SelectedAdapterIdRole,
         HasHostCaptureAdapterRole,
-        SelectedCaptureAdapterIdRole
+        SelectedCaptureAdapterIdRole,
+        SupportsAdaptiveTileRefinementRole,
+        AdaptiveTileRefinementEnabledRole
     };
 
 public:
@@ -51,6 +53,7 @@ public:
     Q_INVOKABLE bool setFileClipboardApproval(int computerIndex, QString expectedFingerprint, bool approved);
     Q_INVOKABLE void setHostAdapter(int computerIndex, QString adapterId);
     Q_INVOKABLE void setHostCaptureAdapter(int computerIndex, QString adapterId);
+    Q_INVOKABLE void setAdaptiveTileRefinement(int computerIndex, bool enabled);
 
     Q_INVOKABLE Session* createSessionForCurrentGame(int computerIndex);
 

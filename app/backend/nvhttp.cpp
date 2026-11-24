@@ -213,7 +213,8 @@ NvHTTP::startApp(QString verb,
                  bool persistGameControllersOnDisconnect,
                  QString& rtspSessionUrl,
                  const QString& sdsChromaMode,
-                 QString extraQueryParams)
+                 QString extraQueryParams,
+                 bool sdsTileRefinement)
 {
     int riKeyId;
 
@@ -221,7 +222,8 @@ NvHTTP::startApp(QString verb,
     riKeyId = qFromBigEndian(riKeyId);
 
     const bool sendHdrMode = (streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) &&
-                             sdsChromaMode.isEmpty();
+                             sdsChromaMode.isEmpty() &&
+                             !sdsTileRefinement;
 
     QString response =
             openConnectionToString(m_BaseUrlHttps,
@@ -243,6 +245,7 @@ NvHTTP::startApp(QString verb,
                                    (!sdsChromaMode.isEmpty() ?
                                        "&sdsChromaMode=" + QString::fromUtf8(QUrl::toPercentEncoding(sdsChromaMode)) :
                                         "")+
+                                   (sdsTileRefinement ? "&sdsTileRefinement=1" : "")+
                                    "&localAudioPlayMode="+QString::number(localAudio ? 1 : 0)+
                                    "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration))+
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+

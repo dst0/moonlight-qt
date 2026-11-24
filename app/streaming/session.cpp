@@ -1,5 +1,7 @@
 #include "session.h"
+#include "backend/identitymanager.h"
 #include "backend/lanpolicy.h"
+#include "backend/sdsclient.h"
 #include "backend/sdslaunchparams.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
@@ -284,7 +286,9 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             StreamingPreferences::RendererSelection renderer,
                             SDL_Window* window, int videoFormat, int width, int height,
                             int frameRate, bool enableVsync, bool enableFramePacing, bool testOnly, IVideoDecoder*& chosenDecoder,
-                            int packedYCoCgRMode, int logicalWidth, int logicalHeight)
+                            int packedYCoCgRMode, int logicalWidth, int logicalHeight,
+                            bool adaptiveTileRefinement,
+                            std::shared_ptr<AdaptiveTileInbox> refinementInbox)
 {
     DECODER_PARAMETERS params{};
 
@@ -306,6 +310,8 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.packedYCoCgRMode = packedYCoCgRMode;
     params.logicalWidth = logicalWidth;
     params.logicalHeight = logicalHeight;
+    params.adaptiveTileRefinement = adaptiveTileRefinement;
+    params.refinementInbox = std::move(refinementInbox);
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "V-sync %s",
@@ -544,7 +550,8 @@ bool Session::populateDecoderProperties(SDL_Window* window)
                        false, false, true, decoder,
                        m_UsePackedYCoCgRA1 ? 1 : 0,
                        m_StreamConfig.width,
-                       m_StreamConfig.height)) {
+                       m_StreamConfig.height,
+                       m_AdaptiveRefinementActive)) {
         return false;
     }
 
@@ -609,6 +616,8 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_Packed444Decision{},
       m_Packed444Layout{},
       m_UsePackedYCoCgRA1(false),
+      m_AdaptiveRefinementDecision{},
+      m_AdaptiveRefinementActive(false),
       m_OpusDecoder(nullptr),
       m_AudioRenderer(nullptr),
       m_AudioSampleCount(0),
@@ -760,10 +769,13 @@ bool Session::initialize(QQuickWindow* qtWindow)
                 "Audio channel mask: %X",
                 CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(m_StreamConfig.audioConfiguration));
 
-    // Evaluate hardware packed YCoCg-R P010 4:4:4 eligibility
+    // Evaluate adaptive dirty-tile refinement & hardware packed YCoCg-R P010 4:4:4 eligibility
     m_UsePackedYCoCgRA1 = false;
     m_Packed444Layout = {};
     m_Packed444Decision = {};
+    m_AdaptiveRefinementActive = false;
+    m_AdaptiveRefinementDecision = {};
+    m_RefinementInbox.reset();
     {
         bool isNvidiaServerSoftware = false;
         bool hasHostEncoder = false;
@@ -775,6 +787,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
         int maxPackedWidth = 0;
         int maxPackedHeight = 0;
         QString gpuModel;
+        QString certFingerprint;
         {
             QReadLocker lock(&m_Computer->lock);
             isNvidiaServerSoftware = m_Computer->isNvidiaServerSoftware;
@@ -787,6 +800,36 @@ bool Session::initialize(QQuickWindow* qtWindow)
             maxPackedWidth = m_Computer->maxPackedWidth;
             maxPackedHeight = m_Computer->maxPackedHeight;
             gpuModel = m_Computer->gpuModel;
+            certFingerprint = SdsLaunch::hostCertFingerprint(m_Computer->serverCert);
+        }
+
+        const bool metalAvailable =
+#ifdef Q_OS_DARWIN
+            VTMetalRendererFactory::isMetalAvailable();
+#else
+            false;
+#endif
+
+        AdaptiveRefinementInputs refInputs;
+        refInputs.hostToggleEnabled = !certFingerprint.isEmpty() && m_Preferences->adaptiveRefinementForHost(certFingerprint);
+        refInputs.hostSupportsTileRefinement = (sdsVersion > 0) && sdsFeatures.contains(QStringLiteral("adaptive_tile_refinement"));
+        refInputs.enableHdr = m_Preferences->enableHdr;
+        refInputs.enableYUV444 = m_Preferences->enableYUV444;
+        refInputs.rendererSelection = m_Preferences->rendererSelection;
+#ifdef Q_OS_DARWIN
+        refInputs.isMacOS = true;
+#else
+        refInputs.isMacOS = false;
+#endif
+        refInputs.isMetalAvailable = metalAvailable;
+
+        m_AdaptiveRefinementDecision = resolveAdaptiveRefinementDecision(refInputs);
+        m_AdaptiveRefinementActive = m_AdaptiveRefinementDecision.active;
+        if (!m_AdaptiveRefinementDecision.statusNote.isEmpty() && refInputs.hostToggleEnabled) {
+            emitLaunchWarning(m_AdaptiveRefinementDecision.statusNote);
+        }
+        if (m_AdaptiveRefinementActive) {
+            m_RefinementInbox = std::make_shared<AdaptiveTileInbox>();
         }
 
         const int effectiveCodecModes = SdsLaunch::effectiveServerCodecModeSupport(
@@ -797,7 +840,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
                     m_Preferences->hostEncoderConfig);
 
         Packed444Inputs packedInputs;
-        packedInputs.enableYUV444 = m_Preferences->enableYUV444;
+        packedInputs.enableYUV444 = m_Preferences->enableYUV444 && !m_AdaptiveRefinementDecision.suppressPackedYCoCgR;
         packedInputs.enableHdr = m_Preferences->enableHdr;
         packedInputs.videoCodecConfig = m_Preferences->videoCodecConfig;
         packedInputs.videoDecoderSelection = m_Preferences->videoDecoderSelection;
@@ -812,11 +855,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
         packedInputs.maxPackedH = (maxPackedHeight > 0) ? maxPackedHeight : 4352;
         packedInputs.logicalW = m_StreamConfig.width;
         packedInputs.logicalH = m_StreamConfig.height;
-#ifdef Q_OS_DARWIN
-        packedInputs.isMacOSMetalAvailable = VTMetalRendererFactory::isMetalAvailable();
-#else
-        packedInputs.isMacOSMetalAvailable = false;
-#endif
+        packedInputs.isMacOSMetalAvailable = metalAvailable;
 
         m_Packed444Decision = resolvePacked444Decision(packedInputs);
         if (!m_Packed444Decision.userWarning.isEmpty()) {
@@ -883,6 +922,8 @@ bool Session::initialize(QQuickWindow* qtWindow)
         m_SupportedVideoFormats.append(VIDEO_FORMAT_H264_HIGH8_444);
         m_SupportedVideoFormats.append(VIDEO_FORMAT_H264);
 
+        const bool wantNativeYuv444 = m_Preferences->enableYUV444 && !m_AdaptiveRefinementActive;
+
         switch (m_Preferences->videoCodecConfig)
         {
         case StreamingPreferences::VCC_AUTO:
@@ -895,7 +936,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
 
             auto hevcDA = getDecoderAvailability(testWindow,
                                                  m_Preferences->videoDecoderSelection,
-                                                 m_Preferences->enableYUV444 ?
+                                                 wantNativeYuv444 ?
                                                      (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_REXT10_444 : VIDEO_FORMAT_H265_REXT8_444) :
                                                      (m_Preferences->enableHdr ? VIDEO_FORMAT_H265_MAIN10 : VIDEO_FORMAT_H265),
                                                  m_StreamConfig.width,
@@ -908,7 +949,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
                 // Check if we have 10-bit AV1 support
                 auto av1DA = getDecoderAvailability(testWindow,
                                                     m_Preferences->videoDecoderSelection,
-                                                    m_Preferences->enableYUV444 ? VIDEO_FORMAT_AV1_HIGH10_444 : VIDEO_FORMAT_AV1_MAIN10,
+                                                    wantNativeYuv444 ? VIDEO_FORMAT_AV1_HIGH10_444 : VIDEO_FORMAT_AV1_MAIN10,
                                                     m_StreamConfig.width,
                                                     m_StreamConfig.height,
                                                     m_StreamConfig.fps);
@@ -921,7 +962,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
                     SDL_assert(!(m_SupportedVideoFormats & VIDEO_FORMAT_MASK_10BIT));
                     hevcDA = getDecoderAvailability(testWindow,
                                                     m_Preferences->videoDecoderSelection,
-                                                    m_Preferences->enableYUV444 ? VIDEO_FORMAT_H265_REXT8_444 : VIDEO_FORMAT_H265,
+                                                    wantNativeYuv444 ? VIDEO_FORMAT_H265_REXT8_444 : VIDEO_FORMAT_H265,
                                                     m_StreamConfig.width,
                                                     m_StreamConfig.height,
                                                     m_StreamConfig.fps);
@@ -967,7 +1008,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
             else if (!m_Preferences->enableHdr &&
                        getDecoderAvailability(testWindow,
                                               m_Preferences->videoDecoderSelection,
-                                              m_Preferences->enableYUV444 ? VIDEO_FORMAT_AV1_HIGH8_444 : VIDEO_FORMAT_AV1_MAIN8,
+                                              wantNativeYuv444 ? VIDEO_FORMAT_AV1_HIGH8_444 : VIDEO_FORMAT_AV1_MAIN8,
                                               m_StreamConfig.width,
                                               m_StreamConfig.height,
                                               m_StreamConfig.fps) != DecoderAvailability::Hardware) {
@@ -1011,8 +1052,8 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // HDR to ensure we never pick a codec profile that doesn't meet the user's requirement
         // if we can avoid it.
 
-        // Mask off YUV 4:4:4 codecs if the option is not enabled
-        if (!m_Preferences->enableYUV444) {
+        // Mask off YUV 4:4:4 codecs if the option is not enabled or adaptive tile refinement handles crisp 4:2:0 text
+        if (!wantNativeYuv444) {
             m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_YUV444);
         }
         else {
@@ -1045,6 +1086,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
                     m_Computer->sdsSoftwareCodecModeSupport,
                     m_Preferences->hostEncoderConfig);
         if (!m_UsePackedYCoCgRA1 &&
+            !m_AdaptiveRefinementActive &&
             SdsLaunch::shouldPreferSoftwareH264Yuv444(
                     m_Computer->isNvidiaServerSoftware,
                     hasHostEncoder,
@@ -1334,7 +1376,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         }
     }
 
-    if (m_Preferences->enableYUV444 && !m_UsePackedYCoCgRA1) {
+    if (m_Preferences->enableYUV444 && !m_UsePackedYCoCgRA1 && !m_AdaptiveRefinementActive) {
         if (!(effectiveCodecModeSupport & SCM_MASK_YUV444)) {
             if (m_Packed444Decision.userWarning.isEmpty()) {
                 emitLaunchWarning(tr("Your host PC doesn't support YUV 4:4:4 streaming."));
@@ -1895,7 +1937,8 @@ bool Session::startConnectionAsync()
                       !m_Preferences->multiController,
                       rtspSessionUrl,
                       m_UsePackedYCoCgRA1 ? QStringLiteral("ycocgr_p010_a1") : QString(),
-                      extraQueryParams);
+                      extraQueryParams,
+                      m_AdaptiveRefinementActive);
     } catch (const GfeHttpResponseException& e) {
         clearStreamSecrets();
         emit displayLaunchError(tr("Host returned error: %1").arg(e.toQString()));
@@ -2259,6 +2302,26 @@ void Session::exec()
                                                          [this]() { return m_MouseEmulationRefCount > 0; });
     m_Sds = sds.get();
 
+    // secure-desktop-stream: adaptive dirty-tile lossless refinement long-poll client
+    std::unique_ptr<SdsTileRefinementClient> tileRefinement;
+    if (m_AdaptiveRefinementActive && m_RefinementInbox) {
+        SdsClient::Config tileCfg;
+        {
+            QReadLocker lock(&m_Computer->lock);
+            tileCfg.host = m_Computer->activeAddress.address();
+            tileCfg.httpsPort = m_Computer->activeHttpsPort != 0 ? m_Computer->activeHttpsPort : DEFAULT_HTTPS_PORT;
+            tileCfg.serverCert = m_Computer->serverCert;
+        }
+        QSslConfiguration identity = IdentityManager::get()->getSslConfig();
+        tileCfg.clientCert = identity.localCertificate();
+        tileCfg.clientKey = identity.privateKey();
+        tileCfg.longPollTimeoutSec = 25;
+        if (!tileCfg.serverCert.isNull() && !tileCfg.host.isEmpty() && tileCfg.httpsPort != 0) {
+            tileRefinement = std::make_unique<SdsTileRefinementClient>(tileCfg, m_RefinementInbox);
+            tileRefinement->start();
+        }
+    }
+
     // Toggle the stats overlay if requested by the user
     m_OverlayManager.setOverlayState(Overlay::OverlayDebug, m_Preferences->showPerformanceOverlay);
 
@@ -2586,7 +2649,9 @@ void Session::exec()
                                    s_ActiveSession->m_VideoDecoder,
                                    m_UsePackedYCoCgRA1 ? 1 : 0,
                                    m_ActiveVideoWidth,
-                                   m_ActiveVideoHeight)) {
+                                   m_ActiveVideoHeight,
+                                   s_ActiveSession->m_AdaptiveRefinementActive,
+                                   s_ActiveSession->m_RefinementInbox)) {
                     SDL_UnlockMutex(m_DecoderLock);
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                                  "Failed to recreate decoder after reset");
@@ -2676,7 +2741,11 @@ void Session::exec()
     }
 
 DispatchDeferredCleanup:
-    // secure-desktop-stream: stop the clipboard/file client before LiStopConnection()
+    // secure-desktop-stream: stop tile refinement and clipboard/file clients before LiStopConnection()
+    tileRefinement.reset();
+    if (m_RefinementInbox) {
+        m_RefinementInbox->clear();
+    }
     m_Sds = nullptr;
     sds.reset();
     // secure-desktop-stream: stop capturing before LiStopConnection() in the cleanup task

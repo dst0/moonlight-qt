@@ -183,6 +183,7 @@ public:
     Q_PROPERTY(HostEncoderConfig hostEncoderConfig MEMBER hostEncoderConfig NOTIFY hostEncoderConfigChanged)
     Q_PROPERTY(QVariantMap hostAdapterOverrides MEMBER hostAdapterOverrides NOTIFY hostAdapterOverridesChanged)
     Q_PROPERTY(QVariantMap hostCaptureAdapterOverrides MEMBER hostCaptureAdapterOverrides NOTIFY hostCaptureAdapterOverridesChanged)
+    Q_PROPERTY(QVariantMap hostAdaptiveRefinement MEMBER hostAdaptiveRefinement NOTIFY hostAdaptiveRefinementChanged)
     Q_PROPERTY(bool matchHostResolution MEMBER matchHostResolution NOTIFY matchHostResolutionChanged)
     Q_PROPERTY(bool revertHostResolution MEMBER revertHostResolution NOTIFY revertHostResolutionChanged)
 
@@ -191,6 +192,8 @@ public:
     Q_INVOKABLE void setHostAdapterOverride(const QString& fingerprint, const QString& adapterId);
     Q_INVOKABLE QString hostCaptureAdapterOverride(const QString& fingerprint) const;
     Q_INVOKABLE void setHostCaptureAdapterOverride(const QString& fingerprint, const QString& adapterId);
+    Q_INVOKABLE bool adaptiveRefinementForHost(const QString& fingerprint) const;
+    Q_INVOKABLE void setAdaptiveRefinementForHost(const QString& fingerprint, bool enabled);
     Q_INVOKABLE static QString hostEncoderQueryValue(HostEncoderConfig config)
     {
         switch (config) {
@@ -266,6 +269,7 @@ public:
     HostEncoderConfig hostEncoderConfig;
     QVariantMap hostAdapterOverrides;
     QVariantMap hostCaptureAdapterOverrides;
+    QVariantMap hostAdaptiveRefinement;
     bool matchHostResolution;
     bool revertHostResolution;
 
@@ -319,6 +323,7 @@ signals:
     void hostEncoderConfigChanged();
     void hostAdapterOverridesChanged();
     void hostCaptureAdapterOverridesChanged();
+    void hostAdaptiveRefinementChanged();
     void matchHostResolutionChanged();
     void revertHostResolutionChanged();
 
