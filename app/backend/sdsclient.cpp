@@ -780,7 +780,9 @@ private:
 
         QNetworkRequest req(url);
         req.setSslConfiguration(m_SslConfig);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
         req.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+#endif
         req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
         req.setAttribute(QNetworkRequest::CacheLoadControlAttribute, QNetworkRequest::AlwaysNetwork);
         req.setAttribute(QNetworkRequest::CacheSaveControlAttribute, false);
@@ -3264,7 +3266,9 @@ private:
 
         QNetworkRequest req(url);
         req.setSslConfiguration(m_SslConfig);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
         req.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+#endif
         req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
         req.setAttribute(QNetworkRequest::CacheLoadControlAttribute, QNetworkRequest::AlwaysNetwork);
         req.setAttribute(QNetworkRequest::CacheSaveControlAttribute, false);

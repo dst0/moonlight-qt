@@ -326,11 +326,17 @@ bool decodeFileClipboard(const QByteArray& json, QList<ClipboardFile>* files)
         names.insert(key);
         const auto encoded = object.value(QStringLiteral("data")).toString().toUtf8();
         if (encoded.size() > ((kFileClipboardBytesMax - total + 2) / 3) * 4) return false;
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
         const auto decoded = QByteArray::fromBase64Encoding(encoded, QByteArray::AbortOnBase64DecodingErrors);
         if (!decoded || decoded.decoded.toBase64() != encoded) return false;
-        total += decoded.decoded.size();
+        const QByteArray& decodedBytes = decoded.decoded;
+#else
+        const QByteArray decodedBytes = QByteArray::fromBase64(encoded);
+        if (decodedBytes.toBase64() != encoded) return false;
+#endif
+        total += decodedBytes.size();
         if (total > kFileClipboardBytesMax) return false;
-        result.append({name, decoded.decoded});
+        result.append(ClipboardFile{name, decodedBytes});
     }
     *files = result;
     return true;
