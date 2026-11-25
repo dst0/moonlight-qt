@@ -188,14 +188,14 @@ QByteArray ClipboardEchoGuard::contentHash(const ClipboardItem& item)
     QCryptographicHash h(QCryptographicHash::Sha256);
     QByteArray len;
     len.setNum(item.text.size());
-    h.addData(QByteArrayView("t"));
+    h.addData(QByteArrayLiteral("t"));
     h.addData(len);
-    h.addData(QByteArrayView(":"));
+    h.addData(QByteArrayLiteral(":"));
     h.addData(item.text);
     len.setNum(item.png.size());
-    h.addData(QByteArrayView("p"));
+    h.addData(QByteArrayLiteral("p"));
     h.addData(len);
-    h.addData(QByteArrayView(":"));
+    h.addData(QByteArrayLiteral(":"));
     h.addData(item.png);
     return h.result();
 }

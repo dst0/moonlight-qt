@@ -137,7 +137,11 @@ bool IdentityManager::isMatchingKeyPair(const QByteArray& certPem, const QByteAr
         return false;
     }
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    BIO* bio = BIO_new_mem_buf(const_cast<char*>(certPem.constData()), certPem.size());
+#else
     BIO* bio = BIO_new_mem_buf(certPem.constData(), certPem.size());
+#endif
     THROW_BAD_ALLOC_IF_NULL(bio);
     X509* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
     BIO_free(bio);
@@ -145,7 +149,11 @@ bool IdentityManager::isMatchingKeyPair(const QByteArray& certPem, const QByteAr
         return false;
     }
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    bio = BIO_new_mem_buf(const_cast<char*>(keyPem.constData()), keyPem.size());
+#else
     bio = BIO_new_mem_buf(keyPem.constData(), keyPem.size());
+#endif
     THROW_BAD_ALLOC_IF_NULL(bio);
     EVP_PKEY* pk = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
     BIO_free(bio);

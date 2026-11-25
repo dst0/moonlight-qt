@@ -26,7 +26,11 @@ NvPairingManager::NvPairingManager(NvComputer* computer) :
     }
 
     QByteArray pk = IdentityManager::get()->getPrivateKey();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    bio = BIO_new_mem_buf(const_cast<char*>(pk.constData()), pk.size());
+#else
     bio = BIO_new_mem_buf(pk.constData(), pk.size());
+#endif
     if (bio == nullptr) {
         pk.fill('\0');
         throw std::bad_alloc();

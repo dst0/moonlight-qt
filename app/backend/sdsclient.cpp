@@ -789,7 +789,11 @@ private:
         req.setHeader(QNetworkRequest::UserAgentHeader, QByteArrayLiteral("Moonlight-SDS/1"));
         if (timeoutMs > 0) {
             // Idle timeout: aborts if no data moves for this long
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
             req.setTransferTimeout(timeoutMs);
+#else
+            Q_UNUSED(timeoutMs);
+#endif
         }
         return req;
     }
@@ -2614,6 +2618,7 @@ private:
             for (int i = 0; i < req.paths.size(); ++i) {
                 QString name;
                 qint64 size = 0;
+#ifdef Q_OS_UNIX
                 QString err;
                 int fd = openVerifiedSourceFile(req.paths[i], &name, &size, false, &err);
                 if (fd < 0) {
@@ -2622,6 +2627,21 @@ private:
                     break;
                 }
                 ::close(fd);
+#else
+                const QFileInfo fi(req.paths[i]);
+                if (!fi.exists() || !fi.isFile()) {
+                    notice(QStringLiteral("Cannot drop non-regular file"));
+                    invalid = true;
+                    break;
+                }
+                name = sanitizeFileName(fi.fileName().normalized(QString::NormalizationForm_C));
+                if (name.isEmpty()) {
+                    notice(QStringLiteral("%1 has an unsupported file name").arg(fi.fileName()));
+                    invalid = true;
+                    break;
+                }
+                size = fi.size();
+#endif
                 QString finalName = name;
                 for (int n = 1; n <= kMaxCollisionIndex &&
                         seenNames.contains(finalName.normalized(QString::NormalizationForm_C).toCaseFolded()); ++n) {
@@ -2666,8 +2686,10 @@ private:
 
         for (int i = 0; i < metas.size(); ++i) {
             const ClipboardEntryMeta& meta = metas.at(i);
-            QString name;
             qint64 size = 0;
+            auto entry = std::make_unique<BatchEntry>();
+#ifdef Q_OS_UNIX
+            QString name;
             QString err;
             int fd = openVerifiedSourceFile(meta.sourcePath, &name, &size, isClipboardOffer, &err);
             if (fd < 0) {
@@ -2677,12 +2699,33 @@ private:
                 }
                 return;
             }
-            auto entry = std::make_unique<BatchEntry>();
             if (!entry->file.open(fd, QIODevice::ReadOnly, QFileDevice::AutoCloseHandle)) {
                 ::close(fd);
                 notice(QStringLiteral("Cannot read %1").arg(elide(meta.name)));
+                if (isClipboardOffer && !existingRemoteId.isEmpty()) {
+                    doCancelLazyClipboardOffer(existingRemoteId);
+                }
                 return;
             }
+#else
+            const QFileInfo fi(meta.sourcePath);
+            if (!fi.isFile()) {
+                notice(QStringLiteral("Cannot read %1").arg(elide(meta.name)));
+                if (isClipboardOffer && !existingRemoteId.isEmpty()) {
+                    doCancelLazyClipboardOffer(existingRemoteId);
+                }
+                return;
+            }
+            entry->file.setFileName(meta.sourcePath);
+            if (!entry->file.open(QIODevice::ReadOnly)) {
+                notice(QStringLiteral("Cannot read %1").arg(elide(meta.name)));
+                if (isClipboardOffer && !existingRemoteId.isEmpty()) {
+                    doCancelLazyClipboardOffer(existingRemoteId);
+                }
+                return;
+            }
+            size = entry->file.size();
+#endif
             if (isClipboardOffer && size != meta.size) {
                 notice(QStringLiteral("%1 changed before transfer").arg(elide(meta.name)));
                 doCancelLazyClipboardOffer(existingRemoteId);
@@ -3228,7 +3271,9 @@ private:
         req.setAttribute(QNetworkRequest::CookieLoadControlAttribute, QNetworkRequest::Manual);
         req.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
         req.setHeader(QNetworkRequest::UserAgentHeader, QByteArrayLiteral("Moonlight-SDS/1"));
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
         req.setTransferTimeout((timeoutSec + 10) * 1000);
+#endif
 
         QNetworkReply* reply = m_Nam->get(req);
         m_ActiveReply = reply;

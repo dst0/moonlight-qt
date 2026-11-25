@@ -209,6 +209,7 @@ bool inspectClipboardFiles(const QStringList& paths,
     QList<ClipboardEntryMeta> result;
     QSet<QString> seenNames;
     qint64 total = 0;
+#ifdef Q_OS_UNIX
     for (int i = 0; i < paths.size(); ++i) {
         QString name;
         qint64 size = 0;
@@ -241,6 +242,16 @@ bool inspectClipboardFiles(const QStringList& paths,
         error->clear();
     }
     return true;
+#else
+    Q_UNUSED(maxTotalBytes);
+    Q_UNUSED(result);
+    Q_UNUSED(seenNames);
+    Q_UNUSED(total);
+    if (error != nullptr) {
+        *error = QStringLiteral("Unsupported platform");
+    }
+    return false;
+#endif
 }
 
 QByteArray snapshotClipboardFiles(const QStringList& paths, QString* error)
