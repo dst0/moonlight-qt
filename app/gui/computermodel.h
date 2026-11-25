@@ -24,7 +24,8 @@ class ComputerModel : public QAbstractListModel
         HasHostCaptureAdapterRole,
         SelectedCaptureAdapterIdRole,
         SupportsAdaptiveTileRefinementRole,
-        AdaptiveTileRefinementEnabledRole
+        AdaptiveTileRefinementEnabledRole,
+        SupportsHostEncoderRole
     };
 
 public:
@@ -54,6 +55,8 @@ public:
     Q_INVOKABLE void setHostAdapter(int computerIndex, QString adapterId);
     Q_INVOKABLE void setHostCaptureAdapter(int computerIndex, QString adapterId);
     Q_INVOKABLE void setAdaptiveTileRefinement(int computerIndex, bool enabled);
+    Q_INVOKABLE QVariantMap getPcSettings(int computerIndex) const;
+    Q_INVOKABLE bool setPcSettings(int computerIndex, const QString& expectedFingerprint, const QVariantMap& settings);
 
     Q_INVOKABLE Session* createSessionForCurrentGame(int computerIndex);
 

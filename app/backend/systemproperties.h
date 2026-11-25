@@ -24,6 +24,7 @@ public:
     Q_PROPERTY(bool hasDesktopEnvironment MEMBER hasDesktopEnvironment CONSTANT)
     Q_PROPERTY(bool hasBrowser MEMBER hasBrowser CONSTANT)
     Q_PROPERTY(bool usesMaterial3Theme MEMBER usesMaterial3Theme CONSTANT)
+    Q_PROPERTY(bool systemDarkMode READ systemDarkMode NOTIFY systemDarkModeChanged)
     Q_PROPERTY(QString versionString MEMBER versionString CONSTANT)
 
     // Properties queried asynchronously (startAsyncLoad() must be called!)
@@ -42,7 +43,10 @@ public:
     Q_INVOKABLE void waitForAsyncLoad();
     Q_INVOKABLE void refreshDisplays();
 
+    bool systemDarkMode() const;
+
 signals:
+    void systemDarkModeChanged();
     void unmappedGamepadsChanged();
     void hasHardwareAccelerationChanged();
     void rendererAlwaysFullScreenChanged();

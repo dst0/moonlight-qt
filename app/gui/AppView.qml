@@ -133,6 +133,7 @@ CenteredGridView {
                     implicitHeight: 85
 
                     icon.source: "qrc:/res/play_arrow_FILL1_wght700_GRAD200_opsz48.svg"
+                    icon.color: "#ffffff"
                     icon.width: 75
                     icon.height: 75
 
@@ -145,7 +146,7 @@ CenteredGridView {
                     ToolTip.timeout: 3000
                     ToolTip.visible: hovered
 
-                    Material.background: "#D0808080"
+                    Material.background: "#D024292F"
                 }
 
                 RoundButton {
@@ -159,6 +160,7 @@ CenteredGridView {
                     implicitHeight: 85
 
                     icon.source: "qrc:/res/stop_FILL1_wght700_GRAD200_opsz48.svg"
+                    icon.color: "#ffffff"
                     icon.width: 75
                     icon.height: 75
 
@@ -171,7 +173,7 @@ CenteredGridView {
                     ToolTip.timeout: 3000
                     ToolTip.visible: hovered
 
-                    Material.background: "#D0808080"
+                    Material.background: "#D024292F"
                 }
             }
         }

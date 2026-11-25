@@ -4,6 +4,8 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QIcon>
+#include <QPainter>
+#include <QQuickImageProvider>
 #include <QQuickStyle>
 #include <QMutex>
 #include <QtDebug>
@@ -977,27 +979,61 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // We require the Material theme
+    // Use the Material theme paired with OS-following Light/Dark palette tokens
     QQuickStyle::setStyle("Material");
 
-    // Our icons are styled for a dark theme, so we do not allow the user to override this
-    qputenv("QT_QUICK_CONTROLS_MATERIAL_THEME", "Dark");
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    const bool systemDark = QGuiApplication::styleHints() &&
+                            QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
+#else
+    const bool systemDark = false;
+#endif
+    qputenv("QT_QUICK_CONTROLS_MATERIAL_THEME", systemDark ? "Dark" : "Light");
 
-    // These are defaults that we allow the user to override
     if (!qEnvironmentVariableIsSet("QT_QUICK_CONTROLS_MATERIAL_ACCENT")) {
-        qputenv("QT_QUICK_CONTROLS_MATERIAL_ACCENT", "Purple");
+        qputenv("QT_QUICK_CONTROLS_MATERIAL_ACCENT", systemDark ? "#58a6ff" : "#0969da");
     }
     if (!qEnvironmentVariableIsSet("QT_QUICK_CONTROLS_MATERIAL_VARIANT")) {
         qputenv("QT_QUICK_CONTROLS_MATERIAL_VARIANT", "Dense");
     }
     if (!qEnvironmentVariableIsSet("QT_QUICK_CONTROLS_MATERIAL_PRIMARY")) {
-        // Qt 6.9 began to use a different shade of Material.Indigo when we use a dark theme
-        // (which is all the time). The new color looks washed out, so manually specify the
-        // old primary color unless the user overrides it themselves.
-        qputenv("QT_QUICK_CONTROLS_MATERIAL_PRIMARY", "#3F51B5");
+        qputenv("QT_QUICK_CONTROLS_MATERIAL_PRIMARY", systemDark ? "#1d2026" : "#f2f4f7");
     }
 
+    class TintedImageProvider final : public QQuickImageProvider
+    {
+    public:
+        TintedImageProvider() : QQuickImageProvider(QQuickImageProvider::Image) {}
+
+        QImage requestImage(const QString& id, QSize* size, const QSize& requestedSize) override
+        {
+            const int slash = id.indexOf('/');
+            if (slash <= 0) {
+                return {};
+            }
+            const QColor tint('#' + id.left(slash));
+            const QString resPath = QStringLiteral(":/") + id.mid(slash + 1);
+            const QSize target = (requestedSize.isValid() && !requestedSize.isEmpty())
+                                 ? requestedSize
+                                 : QSize(48, 48);
+            QImage base = QIcon(resPath).pixmap(target).toImage().convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            if (base.isNull()) {
+                return {};
+            }
+            if (tint.isValid()) {
+                QPainter painter(&base);
+                painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+                painter.fillRect(base.rect(), tint);
+            }
+            if (size) {
+                *size = base.size();
+            }
+            return base;
+        }
+    };
+
     QQmlApplicationEngine engine;
+    engine.addImageProvider(QStringLiteral("tinted"), new TintedImageProvider());
     QString initialView;
     bool hasGUI = true;
 

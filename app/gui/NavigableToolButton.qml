@@ -8,6 +8,7 @@ ToolButton {
     activeFocusOnTab: true
 
     icon.source: iconSource
+    icon.color: (typeof window !== "undefined" && window.theme) ? window.theme.textPrimary : "#1f2328"
     // Size the icon from the button's height rather than its background.
     // Material's background spans the full button width when the content
     // isn't square, so binding the icon to it feeds the button's width back

@@ -40,10 +40,18 @@ ComboBox {
         // Switch to normal navigation for combo boxes
         SdlGamepadKeyNavigation.setUiNavMode(false)
 
-        // Override the popup color to improve contrast with the overridden
-        // Material 2 background color set in main.qml.
-        if (SystemProperties.usesMaterial3Theme) {
-            popup.background.color = "#424242"
+        // Match the active Light/Dark surface palette instead of hardcoding dark grey
+        if (popup.background) {
+            if (typeof window !== "undefined" && window.theme) {
+                popup.background.color = window.theme.bgSurface
+                if (popup.background.border !== undefined) {
+                    popup.background.border.color = window.theme.border
+                    popup.background.border.width = 1
+                }
+            }
+            else if (SystemProperties.usesMaterial3Theme) {
+                popup.background.color = "#ffffff"
+            }
         }
     }
 

@@ -31,9 +31,16 @@ NavigableDialog {
 
         Image {
             id: dialogImage
-            source: (standardButtons & Dialog.Yes) ?
-                        "qrc:/res/baseline-help_outline-24px.svg" :
-                        "qrc:/res/baseline-error_outline-24px.svg"
+            source: {
+                var resPath = (standardButtons & Dialog.Yes)
+                              ? "res/baseline-help_outline-24px.svg"
+                              : "res/baseline-error_outline-24px.svg"
+                if (typeof window !== "undefined" && window.tintedUrl) {
+                    var tint = (standardButtons & Dialog.Yes) ? window.theme.accent : window.theme.dangerText
+                    return window.tintedUrl(tint, resPath)
+                }
+                return "qrc:/" + resPath
+            }
             sourceSize {
                 // The icon should be square so use the height as the width too
                 width: 50

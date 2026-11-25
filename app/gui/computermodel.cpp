@@ -87,6 +87,10 @@ QVariant ComputerModel::data(const QModelIndex& index, int role) const
         QString fp = QString::fromLatin1(computer->serverCert.digest(QCryptographicHash::Sha256).toHex());
         return StreamingPreferences::get()->adaptiveRefinementForHost(fp);
     }
+    case SupportsHostEncoderRole:
+        return computer->pairState == NvComputer::PS_PAIRED &&
+               !computer->isNvidiaServerSoftware &&
+               computer->hasSdsFeature(QStringLiteral("host_encoder"));
     case DetailsRole: {
         QString state, pairState;
 
@@ -163,6 +167,7 @@ QHash<int, QByteArray> ComputerModel::roleNames() const
     names[SelectedCaptureAdapterIdRole] = "selectedCaptureAdapterId";
     names[SupportsAdaptiveTileRefinementRole] = "supportsAdaptiveTileRefinement";
     names[AdaptiveTileRefinementEnabledRole] = "adaptiveTileRefinementEnabled";
+    names[SupportsHostEncoderRole] = "supportsHostEncoder";
 
     return names;
 }
@@ -210,6 +215,135 @@ void ComputerModel::setAdaptiveTileRefinement(int computerIndex, bool enabled)
     prefs->setAdaptiveRefinementForHost(fingerprint, enabled);
     prefs->save();
     emit dataChanged(index(computerIndex), index(computerIndex), {AdaptiveTileRefinementEnabledRole});
+}
+
+QVariantMap ComputerModel::getPcSettings(int computerIndex) const
+{
+    QVariantMap result;
+    if (computerIndex < 0 || computerIndex >= m_Computers.size()) {
+        return result;
+    }
+
+    const auto computer = m_Computers[computerIndex];
+    QVariantList adapterList;
+    QString fp;
+    bool paired = false;
+    bool online = false;
+    bool capabilitiesKnown = false;
+    bool supportsAdaptive = false;
+    bool supportsHostEncoder = false;
+    bool hasHostCaptureAdapter = false;
+    {
+        QReadLocker lock(&computer->lock);
+        paired = (computer->pairState == NvComputer::PS_PAIRED);
+        online = (computer->state == NvComputer::CS_ONLINE);
+        capabilitiesKnown = online || computer->sdsVersion > 0;
+        if (paired && !computer->serverCert.isNull()) {
+            fp = QString::fromLatin1(computer->serverCert.digest(QCryptographicHash::Sha256).toHex());
+        }
+        supportsAdaptive = paired && computer->hasSdsFeature(QStringLiteral("adaptive_tile_refinement"));
+        supportsHostEncoder = paired && !computer->isNvidiaServerSoftware &&
+                              computer->hasSdsFeature(QStringLiteral("host_encoder"));
+        hasHostCaptureAdapter = paired && !computer->isNvidiaServerSoftware &&
+                                computer->hasSdsFeature(QStringLiteral("host_capture_adapter"));
+        for (const NvHostAdapter& adapter : computer->sdsAdapters) {
+            QVariantMap entry;
+            entry.insert(QStringLiteral("id"), adapter.id);
+            entry.insert(QStringLiteral("name"), adapter.name);
+            entry.insert(QStringLiteral("pciSlot"), adapter.pciSlot);
+            entry.insert(QStringLiteral("isDefault"), adapter.isDefault);
+            entry.insert(QStringLiteral("isCaptureDefault"), adapter.isCaptureDefault);
+            adapterList.append(entry);
+        }
+    }
+
+    auto prefs = StreamingPreferences::get();
+    const int playAudioState = prefs->playAudioOnHostOverrideState(fp);
+    const int muteState = (playAudioState < 0) ? -1 : (playAudioState == 0 ? 1 : 0);
+
+    result.insert(QStringLiteral("fingerprint"), fp);
+    result.insert(QStringLiteral("hostOnline"), online);
+    result.insert(QStringLiteral("capabilitiesKnown"), capabilitiesKnown);
+    result.insert(QStringLiteral("supportsAdaptiveTileRefinement"), supportsAdaptive);
+    result.insert(QStringLiteral("adaptiveTileRefinement"), prefs->adaptiveRefinementForHost(fp));
+    result.insert(QStringLiteral("supportsHostEncoder"), supportsHostEncoder);
+    result.insert(QStringLiteral("hostEncoderConfig"), static_cast<int>(prefs->hostEncoderForHost(fp)));
+    result.insert(QStringLiteral("hasMultipleAdapters"), paired && adapterList.size() > 1);
+    result.insert(QStringLiteral("hasHostCaptureAdapter"), (paired && adapterList.size() > 1) && hasHostCaptureAdapter);
+    result.insert(QStringLiteral("adapters"), adapterList);
+    result.insert(QStringLiteral("selectedAdapterId"), prefs->hostAdapterOverride(fp));
+    result.insert(QStringLiteral("selectedCaptureAdapterId"), prefs->hostCaptureAdapterOverride(fp));
+    result.insert(QStringLiteral("matchHostResolutionOverride"), prefs->matchHostResolutionOverrideState(fp));
+    result.insert(QStringLiteral("revertHostResolutionOverride"), prefs->revertHostResolutionOverrideState(fp));
+    result.insert(QStringLiteral("muteHostSpeakersOverride"), muteState);
+    result.insert(QStringLiteral("gameOptimizationsOverride"), prefs->gameOptimizationsOverrideState(fp));
+    result.insert(QStringLiteral("quitAppAfterOverride"), prefs->quitAppAfterOverrideState(fp));
+    return result;
+}
+
+bool ComputerModel::setPcSettings(int computerIndex, const QString& expectedFingerprint, const QVariantMap& settings)
+{
+    if (expectedFingerprint.isEmpty()) {
+        return false;
+    }
+
+    int targetIndex = -1;
+    if (computerIndex >= 0 && computerIndex < m_Computers.size() &&
+        fileClipboardFingerprint(computerIndex) == expectedFingerprint) {
+        targetIndex = computerIndex;
+    } else {
+        for (int i = 0; i < m_Computers.size(); ++i) {
+            if (fileClipboardFingerprint(i) == expectedFingerprint) {
+                targetIndex = i;
+                break;
+            }
+        }
+    }
+    if (targetIndex < 0) {
+        return false;
+    }
+
+    const QString& fingerprint = expectedFingerprint;
+    auto prefs = StreamingPreferences::get();
+    if (settings.contains(QStringLiteral("adaptiveTileRefinement"))) {
+        prefs->setAdaptiveRefinementForHost(fingerprint, settings.value(QStringLiteral("adaptiveTileRefinement")).toBool());
+    }
+    if (settings.contains(QStringLiteral("hostEncoderConfig"))) {
+        prefs->setHostEncoderForHost(
+            fingerprint,
+            static_cast<StreamingPreferences::HostEncoderConfig>(settings.value(QStringLiteral("hostEncoderConfig")).toInt()));
+    }
+    if (settings.contains(QStringLiteral("selectedAdapterId"))) {
+        prefs->setHostAdapterOverride(fingerprint, settings.value(QStringLiteral("selectedAdapterId")).toString());
+    }
+    if (settings.contains(QStringLiteral("selectedCaptureAdapterId"))) {
+        prefs->setHostCaptureAdapterOverride(fingerprint, settings.value(QStringLiteral("selectedCaptureAdapterId")).toString());
+    }
+    if (settings.contains(QStringLiteral("matchHostResolutionOverride"))) {
+        prefs->setMatchHostResolutionOverride(fingerprint, settings.value(QStringLiteral("matchHostResolutionOverride")).toInt());
+    }
+    if (settings.contains(QStringLiteral("revertHostResolutionOverride"))) {
+        prefs->setRevertHostResolutionOverride(fingerprint, settings.value(QStringLiteral("revertHostResolutionOverride")).toInt());
+    }
+    if (settings.contains(QStringLiteral("muteHostSpeakersOverride"))) {
+        const int muteState = settings.value(QStringLiteral("muteHostSpeakersOverride")).toInt();
+        const int playAudioState = (muteState < 0) ? -1 : (muteState > 0 ? 0 : 1);
+        prefs->setPlayAudioOnHostOverride(fingerprint, playAudioState);
+    }
+    if (settings.contains(QStringLiteral("gameOptimizationsOverride"))) {
+        prefs->setGameOptimizationsOverride(fingerprint, settings.value(QStringLiteral("gameOptimizationsOverride")).toInt());
+    }
+    if (settings.contains(QStringLiteral("quitAppAfterOverride"))) {
+        prefs->setQuitAppAfterOverride(fingerprint, settings.value(QStringLiteral("quitAppAfterOverride")).toInt());
+    }
+
+    prefs->save();
+    emit dataChanged(index(targetIndex), index(targetIndex), {
+        SelectedAdapterIdRole,
+        SelectedCaptureAdapterIdRole,
+        AdaptiveTileRefinementEnabledRole
+    });
+    return true;
 }
 
 bool ComputerModel::setFileClipboardApproval(int computerIndex, QString expectedFingerprint, bool approved)

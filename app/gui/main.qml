@@ -21,15 +21,43 @@ ApplicationWindow {
     width: 1280
     height: 600
 
+    // Clean Light / Dark design system tokens following OS appearance
+    readonly property QtObject theme: QtObject {
+        readonly property bool isDark: SystemProperties.systemDarkMode
+        readonly property color bgMain: isDark ? "#17181c" : "#fafafa"
+        readonly property color bgHeader: isDark ? "#1d2026" : "#f2f4f7"
+        readonly property color bgSurface: isDark ? "#22252c" : "#ffffff"
+        readonly property color bgHover: isDark ? "#2b303a" : "#eaeef2"
+        readonly property color bgSelected: isDark ? "#1f3552" : "#ddf4ff"
+        readonly property color border: isDark ? "#343b46" : "#d0d7de"
+        readonly property color textPrimary: isDark ? "#eef1f6" : "#1f2328"
+        readonly property color textSecondary: isDark ? "#9aa4b2" : "#59636e"
+        readonly property color accent: isDark ? "#58a6ff" : "#0969da"
+        readonly property color accentHoverBg: isDark ? "#243b55" : "#dbeafe"
+        readonly property color infoText: isDark ? "#79c0ff" : "#0550ae"
+        readonly property color warningText: isDark ? "#e5a93c" : "#9a6700"
+        readonly property color dangerText: isDark ? "#f85149" : "#cf222f"
+        readonly property color successText: isDark ? "#3fb950" : "#1a7f37"
+    }
+
+    function tintedUrl(colorVal, resPath) {
+        var hex = ("" + colorVal).replace("#", "")
+        if (hex.length === 8) {
+            hex = hex.substring(2)
+        }
+        var cleanPath = resPath.indexOf("qrc:/") === 0 ? resPath.substring(5) : resPath
+        return "image://tinted/" + hex + "/" + cleanPath
+    }
+
+    Material.theme: theme.isDark ? Material.Dark : Material.Light
+    Material.background: theme.bgMain
+    Material.foreground: theme.textPrimary
+    Material.accent: theme.accent
+    Material.primary: theme.bgHeader
+    Material.elevation: 0
+
     // This function runs prior to creation of the initial StackView item
     function doEarlyInit() {
-        // Override the background color to Material 2 colors for Qt 6.5+
-        // in order to improve contrast between GFE's placeholder box art
-        // and the background of the app grid.
-        if (SystemProperties.usesMaterial3Theme) {
-            Material.background = "#303030"
-        }
-
         SdlGamepadKeyNavigation.enable()
     }
 
@@ -242,16 +270,27 @@ ApplicationWindow {
 
     header: ToolBar {
         id: toolBar
-        height: 60
-        anchors.topMargin: 5
-        anchors.bottomMargin: 5
+        height: 56
+        Material.elevation: 0
+        background: Rectangle {
+            color: window.theme.bgHeader
+            Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: 1
+                color: window.theme.border
+            }
+        }
 
         Label {
             id: titleLabel
             visible: toolBar.width > 700
             anchors.fill: parent
-            text: stackView.currentItem.objectName
-            font.pointSize: 20
+            text: stackView.currentItem ? stackView.currentItem.objectName : ""
+            color: window.theme.textPrimary
+            font.pointSize: 18
+            font.weight: Font.DemiBold
             elide: Label.ElideRight
             horizontalAlignment: Qt.AlignHCenter
             verticalAlignment: Qt.AlignVCenter
@@ -281,6 +320,8 @@ ApplicationWindow {
             Label {
                 id: titleRowLabel
                 font.pointSize: titleLabel.font.pointSize
+                font.weight: titleLabel.font.weight
+                color: window.theme.textPrimary
                 elide: Label.ElideRight
                 horizontalAlignment: Qt.AlignHCenter
                 verticalAlignment: Qt.AlignVCenter
@@ -289,14 +330,15 @@ ApplicationWindow {
                 // We need this label to always be visible so it can occupy
                 // the remaining space in the RowLayout. To "hide" it, we
                 // just set the text to empty string.
-                text: !titleLabel.visible ? stackView.currentItem.objectName : ""
+                text: !titleLabel.visible && stackView.currentItem ? stackView.currentItem.objectName : ""
             }
 
             Label {
                 id: versionLabel
                 visible: stackView.currentItem instanceof SettingsView
                 text: qsTr("Version %1").arg(SystemProperties.versionString)
-                font.pointSize: 12
+                color: window.theme.textSecondary
+                font.pointSize: 11
                 horizontalAlignment: Qt.AlignRight
                 verticalAlignment: Qt.AlignVCenter
             }
@@ -390,7 +432,7 @@ ApplicationWindow {
                 ToolTip.delay: 1000
                 ToolTip.timeout: 3000
                 ToolTip.visible: hovered
-                ToolTip.text: qsTr("Settings") + (settingsShortcut.nativeText ? (" ("+settingsShortcut.nativeText+")") : "")
+                ToolTip.text: qsTr("Global Settings") + (settingsShortcut.nativeText ? (" ("+settingsShortcut.nativeText+")") : "")
             }
         }
     }

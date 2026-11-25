@@ -181,19 +181,45 @@ public:
 
     // secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
     Q_PROPERTY(HostEncoderConfig hostEncoderConfig MEMBER hostEncoderConfig NOTIFY hostEncoderConfigChanged)
+    Q_PROPERTY(QVariantMap hostEncoderOverrides MEMBER hostEncoderOverrides NOTIFY hostEncoderOverridesChanged)
     Q_PROPERTY(QVariantMap hostAdapterOverrides MEMBER hostAdapterOverrides NOTIFY hostAdapterOverridesChanged)
     Q_PROPERTY(QVariantMap hostCaptureAdapterOverrides MEMBER hostCaptureAdapterOverrides NOTIFY hostCaptureAdapterOverridesChanged)
     Q_PROPERTY(QVariantMap hostAdaptiveRefinement MEMBER hostAdaptiveRefinement NOTIFY hostAdaptiveRefinementChanged)
+    Q_PROPERTY(QVariantMap hostMatchResolutionOverrides MEMBER hostMatchResolutionOverrides NOTIFY hostMatchResolutionOverridesChanged)
+    Q_PROPERTY(QVariantMap hostRevertResolutionOverrides MEMBER hostRevertResolutionOverrides NOTIFY hostRevertResolutionOverridesChanged)
+    Q_PROPERTY(QVariantMap hostGameOptimizationsOverrides MEMBER hostGameOptimizationsOverrides NOTIFY hostGameOptimizationsOverridesChanged)
+    Q_PROPERTY(QVariantMap hostQuitAppAfterOverrides MEMBER hostQuitAppAfterOverrides NOTIFY hostQuitAppAfterOverridesChanged)
+    Q_PROPERTY(QVariantMap hostPlayAudioOverrides MEMBER hostPlayAudioOverrides NOTIFY hostPlayAudioOverridesChanged)
     Q_PROPERTY(bool matchHostResolution MEMBER matchHostResolution NOTIFY matchHostResolutionChanged)
     Q_PROPERTY(bool revertHostResolution MEMBER revertHostResolution NOTIFY revertHostResolutionChanged)
 
     Q_INVOKABLE bool retranslate();
+    Q_INVOKABLE HostEncoderConfig hostEncoderForHost(const QString& fingerprint) const;
+    Q_INVOKABLE void setHostEncoderForHost(const QString& fingerprint, HostEncoderConfig config);
     Q_INVOKABLE QString hostAdapterOverride(const QString& fingerprint) const;
     Q_INVOKABLE void setHostAdapterOverride(const QString& fingerprint, const QString& adapterId);
     Q_INVOKABLE QString hostCaptureAdapterOverride(const QString& fingerprint) const;
     Q_INVOKABLE void setHostCaptureAdapterOverride(const QString& fingerprint, const QString& adapterId);
     Q_INVOKABLE bool adaptiveRefinementForHost(const QString& fingerprint) const;
     Q_INVOKABLE void setAdaptiveRefinementForHost(const QString& fingerprint, bool enabled);
+    // Per-PC bool override states: -1 = Global Default, 0 = Disabled, 1 = Enabled
+    Q_INVOKABLE int matchHostResolutionOverrideState(const QString& fingerprint) const;
+    Q_INVOKABLE void setMatchHostResolutionOverride(const QString& fingerprint, int state);
+    Q_INVOKABLE bool matchHostResolutionForHost(const QString& fingerprint) const;
+    Q_INVOKABLE int revertHostResolutionOverrideState(const QString& fingerprint) const;
+    Q_INVOKABLE void setRevertHostResolutionOverride(const QString& fingerprint, int state);
+    Q_INVOKABLE bool revertHostResolutionForHost(const QString& fingerprint) const;
+    Q_INVOKABLE bool effectiveRevertHostResolutionForHost(const QString& fingerprint) const;
+    Q_INVOKABLE int gameOptimizationsOverrideState(const QString& fingerprint) const;
+    Q_INVOKABLE void setGameOptimizationsOverride(const QString& fingerprint, int state);
+    Q_INVOKABLE bool gameOptimizationsForHost(const QString& fingerprint) const;
+    Q_INVOKABLE int quitAppAfterOverrideState(const QString& fingerprint) const;
+    Q_INVOKABLE void setQuitAppAfterOverride(const QString& fingerprint, int state);
+    Q_INVOKABLE bool quitAppAfterForHost(const QString& fingerprint) const;
+    Q_INVOKABLE int playAudioOnHostOverrideState(const QString& fingerprint) const;
+    Q_INVOKABLE void setPlayAudioOnHostOverride(const QString& fingerprint, int state);
+    Q_INVOKABLE bool playAudioOnHostForHost(const QString& fingerprint) const;
+    Q_INVOKABLE bool clearHostOverrides(const QString& fingerprint);
     Q_INVOKABLE static QString hostEncoderQueryValue(HostEncoderConfig config)
     {
         switch (config) {
@@ -267,9 +293,15 @@ public:
 
     // secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
     HostEncoderConfig hostEncoderConfig;
+    QVariantMap hostEncoderOverrides;
     QVariantMap hostAdapterOverrides;
     QVariantMap hostCaptureAdapterOverrides;
     QVariantMap hostAdaptiveRefinement;
+    QVariantMap hostMatchResolutionOverrides;
+    QVariantMap hostRevertResolutionOverrides;
+    QVariantMap hostGameOptimizationsOverrides;
+    QVariantMap hostQuitAppAfterOverrides;
+    QVariantMap hostPlayAudioOverrides;
     bool matchHostResolution;
     bool revertHostResolution;
 
@@ -321,9 +353,15 @@ signals:
 
     // secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
     void hostEncoderConfigChanged();
+    void hostEncoderOverridesChanged();
     void hostAdapterOverridesChanged();
     void hostCaptureAdapterOverridesChanged();
     void hostAdaptiveRefinementChanged();
+    void hostMatchResolutionOverridesChanged();
+    void hostRevertResolutionOverridesChanged();
+    void hostGameOptimizationsOverridesChanged();
+    void hostQuitAppAfterOverridesChanged();
+    void hostPlayAudioOverridesChanged();
     void matchHostResolutionChanged();
     void revertHostResolutionChanged();
 

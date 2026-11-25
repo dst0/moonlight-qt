@@ -452,7 +452,10 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     }
 
     // Resolve --quit-after and --no-quit-after options
-    preferences->quitAppAfter = parser.getToggleOptionValue("quit-after", preferences->quitAppAfter);
+    if (parser.isSet("quit-after") || parser.isSet("no-quit-after")) {
+        preferences->quitAppAfter = parser.getToggleOptionValue("quit-after", preferences->quitAppAfter);
+        preferences->hostQuitAppAfterOverrides.clear();
+    }
 
     // Resolve --absolute-mouse and --no-absolute-mouse options
     preferences->absoluteMouseMode = parser.getToggleOptionValue("absolute-mouse", preferences->absoluteMouseMode);
@@ -464,10 +467,16 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     preferences->absoluteTouchMode = !parser.getToggleOptionValue("touchscreen-trackpad", !preferences->absoluteTouchMode);
 
     // Resolve --game-optimization and --no-game-optimization options
-    preferences->gameOptimizations = parser.getToggleOptionValue("game-optimization", preferences->gameOptimizations);
+    if (parser.isSet("game-optimization") || parser.isSet("no-game-optimization")) {
+        preferences->gameOptimizations = parser.getToggleOptionValue("game-optimization", preferences->gameOptimizations);
+        preferences->hostGameOptimizationsOverrides.clear();
+    }
 
     // Resolve --audio-on-host and --no-audio-on-host options
-    preferences->playAudioOnHost = parser.getToggleOptionValue("audio-on-host", preferences->playAudioOnHost);
+    if (parser.isSet("audio-on-host") || parser.isSet("no-audio-on-host")) {
+        preferences->playAudioOnHost = parser.getToggleOptionValue("audio-on-host", preferences->playAudioOnHost);
+        preferences->hostPlayAudioOverrides.clear();
+    }
 
     // Resolve --frame-pacing and --no-frame-pacing options
     preferences->framePacing = parser.getToggleOptionValue("frame-pacing", preferences->framePacing);

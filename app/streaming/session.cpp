@@ -607,6 +607,7 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_MouseEmulationRefCount(0),
       m_FlushingWindowEventsRef(0),
       m_ShouldExit(false),
+      m_ForceQuitHostApp(false),
       m_AsyncConnectionSuccess(false),
       m_PortTestResults(0),
       m_ActiveVideoFormat(0),
@@ -832,12 +833,14 @@ bool Session::initialize(QQuickWindow* qtWindow)
             m_RefinementInbox = std::make_shared<AdaptiveTileInbox>();
         }
 
+        const auto hostEncoderConfig = m_Preferences->hostEncoderForHost(certFingerprint);
+
         const int effectiveCodecModes = SdsLaunch::effectiveServerCodecModeSupport(
                     isNvidiaServerSoftware,
                     hasHostEncoder,
                     serverCodecModeSupport,
                     swServerCodecModeSupport,
-                    m_Preferences->hostEncoderConfig);
+                    hostEncoderConfig);
 
         Packed444Inputs packedInputs;
         packedInputs.enableYUV444 = m_Preferences->enableYUV444 && !m_AdaptiveRefinementDecision.suppressPackedYCoCgR;
@@ -845,9 +848,9 @@ bool Session::initialize(QQuickWindow* qtWindow)
         packedInputs.videoCodecConfig = m_Preferences->videoCodecConfig;
         packedInputs.videoDecoderSelection = m_Preferences->videoDecoderSelection;
         packedInputs.rendererSelection = m_Preferences->rendererSelection;
-        packedInputs.hostEncoderConfig = hasHostEncoder ? m_Preferences->hostEncoderConfig : StreamingPreferences::HEC_AUTO;
+        packedInputs.hostEncoderConfig = hasHostEncoder ? hostEncoderConfig : StreamingPreferences::HEC_AUTO;
         packedInputs.hostEncoderIsSoftware =
-                (hasHostEncoder && m_Preferences->hostEncoderConfig == StreamingPreferences::HEC_SOFTWARE) ||
+                (hasHostEncoder && hostEncoderConfig == StreamingPreferences::HEC_SOFTWARE) ||
                 gpuModel.contains(QStringLiteral("software"), Qt::CaseInsensitive);
         packedInputs.hostSupportsHwYCoCgR444 = (sdsVersion > 0) && sdsFeatures.contains(QStringLiteral("hw_ycocgr_444"));
         packedInputs.hostNativeYuv444Supported = (effectiveCodecModes & SCM_MASK_YUV444) != 0;
@@ -1079,18 +1082,20 @@ bool Session::initialize(QQuickWindow* qtWindow)
         QReadLocker lock(&m_Computer->lock);
         bool hasHostEncoder = !m_Computer->isNvidiaServerSoftware &&
                               m_Computer->hasSdsFeature(QStringLiteral("host_encoder"));
+        const auto hostEncoderConfig = m_Preferences->hostEncoderForHost(
+                    SdsLaunch::hostCertFingerprint(m_Computer->serverCert));
         int effectiveCodecModes = SdsLaunch::effectiveServerCodecModeSupport(
                     m_Computer->isNvidiaServerSoftware,
                     hasHostEncoder,
                     m_Computer->serverCodecModeSupport,
                     m_Computer->sdsSoftwareCodecModeSupport,
-                    m_Preferences->hostEncoderConfig);
+                    hostEncoderConfig);
         if (!m_UsePackedYCoCgRA1 &&
             !m_AdaptiveRefinementActive &&
             SdsLaunch::shouldPreferSoftwareH264Yuv444(
                     m_Computer->isNvidiaServerSoftware,
                     hasHostEncoder,
-                    m_Preferences->hostEncoderConfig,
+                    hostEncoderConfig,
                     m_Preferences->videoCodecConfig,
                     m_Preferences->enableYUV444,
                     effectiveCodecModes) &&
@@ -1186,6 +1191,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
     int maxLumaPixelsHEVC = 0;
     QString computerName;
     QString gfeVersion;
+    QString certFingerprint;
     {
         QReadLocker lock(&m_Computer->lock);
         isNvidiaServerSoftware = m_Computer->isNvidiaServerSoftware;
@@ -1196,20 +1202,22 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         maxLumaPixelsHEVC = m_Computer->maxLumaPixelsHEVC;
         computerName = m_Computer->name;
         gfeVersion = m_Computer->gfeVersion;
+        certFingerprint = SdsLaunch::hostCertFingerprint(m_Computer->serverCert);
     }
 
+    const auto hostEncoderConfig = m_Preferences->hostEncoderForHost(certFingerprint);
     const int effectiveCodecModeSupport = SdsLaunch::effectiveServerCodecModeSupport(
                 isNvidiaServerSoftware,
                 hasHostEncoder,
                 rawServerCodecModeSupport,
                 swServerCodecModeSupport,
-                m_Preferences->hostEncoderConfig);
+                hostEncoderConfig);
     const bool hostHevcSupported = SdsLaunch::isHostHevcSupported(
                 isNvidiaServerSoftware,
                 hasHostEncoder,
                 maxLumaPixelsHEVC,
                 effectiveCodecModeSupport,
-                m_Preferences->hostEncoderConfig);
+                hostEncoderConfig);
 
     if (!isSupportedServerVersion) {
         emit displayLaunchError(tr("The version of GeForce Experience on %1 is not supported by this build of Moonlight. You must update Moonlight to stream from %1.").arg(computerName));
@@ -1517,10 +1525,17 @@ private:
 
     void run() override
     {
+        QString certFingerprint;
+        {
+            QReadLocker lock(&m_Session->m_Computer->lock);
+            certFingerprint = SdsLaunch::hostCertFingerprint(m_Session->m_Computer->serverCert);
+        }
+
         // Only quit the running app if our session terminated gracefully
         bool shouldQuit =
                 !m_Session->m_UnexpectedTermination &&
-                m_Session->m_Preferences->quitAppAfter;
+                (m_Session->m_ForceQuitHostApp ||
+                 m_Session->m_Preferences->quitAppAfterForHost(certFingerprint));
 
         // Notify the UI
         if (shouldQuit) {
@@ -1880,6 +1895,11 @@ bool Session::startConnectionAsync()
         return false;
     }
 
+    const QString fingerprint = SdsLaunch::hostCertFingerprint(serverCert);
+    const auto hostEncoderConfig = m_Preferences->hostEncoderForHost(fingerprint);
+    const bool hostGameOptimizations = m_Preferences->gameOptimizationsForHost(fingerprint);
+    const bool hostPlayAudio = m_Preferences->playAudioOnHostForHost(fingerprint);
+
     bool enableGameOptimizations;
     if (isNvidiaServerSoftware) {
         // GFE will set all settings to 720p60 if it doesn't recognize
@@ -1892,7 +1912,7 @@ bool Session::startConnectionAsync()
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Found host supported resolution: %dx%d",
                             mode.width, mode.height);
-                enableGameOptimizations = m_Preferences->gameOptimizations;
+                enableGameOptimizations = hostGameOptimizations;
                 break;
             }
         }
@@ -1900,10 +1920,9 @@ bool Session::startConnectionAsync()
     else {
         // Always send SOPS to Sunshine because we may repurpose the
         // option to control whether the display mode is adjusted
-        enableGameOptimizations = m_Preferences->gameOptimizations;
+        enableGameOptimizations = hostGameOptimizations;
     }
 
-    const QString fingerprint = SdsLaunch::hostCertFingerprint(serverCert);
     const QString selectedAdapterId = fingerprint.isEmpty()
             ? QString()
             : m_Preferences->hostAdapterOverride(fingerprint);
@@ -1915,12 +1934,12 @@ bool Session::startConnectionAsync()
                 isNvidiaServerSoftware,
                 hasHostEncoder,
                 hasHostResolution,
-                m_Preferences->hostEncoderConfig,
+                hostEncoderConfig,
                 sdsAdapters,
                 selectedAdapterId,
                 hevcRequested,
-                m_Preferences->matchHostResolution,
-                m_Preferences->effectiveRevertHostResolution(),
+                m_Preferences->matchHostResolutionForHost(fingerprint),
+                m_Preferences->effectiveRevertHostResolutionForHost(fingerprint),
                 hasHostCaptureAdapter,
                 selectedCaptureAdapterId);
 
@@ -1932,7 +1951,7 @@ bool Session::startConnectionAsync()
                       isNvidiaServerSoftware,
                       m_App.id, &m_StreamConfig,
                       enableGameOptimizations,
-                      m_Preferences->playAudioOnHost,
+                      hostPlayAudio,
                       m_InputHandler->getAttachedGamepadMask(),
                       !m_Preferences->multiController,
                       rtspSessionUrl,
@@ -1962,7 +1981,7 @@ bool Session::startConnectionAsync()
                     hasHostEncoder,
                     m_Computer->serverCodecModeSupport,
                     m_Computer->sdsSoftwareCodecModeSupport,
-                    m_Preferences->hostEncoderConfig);
+                    hostEncoderConfig);
     }
 
     if (!LanPolicy::isPermittedConnectionTarget(QHostAddress(activeAddress.address()))) {
@@ -2086,7 +2105,7 @@ void Session::setShouldExit(bool quitHostApp)
     // caller doesn't override to force quit, let the preferences
     // dictate what we do.
     if (quitHostApp) {
-        m_Preferences->quitAppAfter = true;
+        m_ForceQuitHostApp = true;
     }
 
     m_ShouldExit = true;

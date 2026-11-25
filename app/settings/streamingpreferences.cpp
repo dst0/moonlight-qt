@@ -64,9 +64,15 @@
 #define SER_SDSAUTODOWNLOAD "sdsautodownload"
 // secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
 #define SER_SDSHOSTENCODER "sdshostencoder"
+#define SER_SDSHOSTENCODEROVERRIDES "sdshostencoderoverrides"
 #define SER_SDSHOSTADAPTERS "sdshostadapters"
 #define SER_SDSHOSTCAPTUREADAPTERS "sdshostcaptureadapters"
 #define SER_SDSHOSTADAPTIVEREFINEMENT "sdshostadaptiverefinement"
+#define SER_SDSHOSTMATCHRES "sdshostmatchres"
+#define SER_SDSHOSTREVERTRES "sdshostrevertres"
+#define SER_HOSTGAMEOPTS "hostgameopts"
+#define SER_HOSTQUITAPPAFTER "hostquitappafter"
+#define SER_HOSTPLAYAUDIO "hostplayaudio"
 #define SER_SDSMATCHHOSTRES "sdsmatchhostres"
 #define SER_SDSREVERTHOSTRES "sdsreverthostres"
 
@@ -204,9 +210,15 @@ void StreamingPreferences::reload()
         rawHostEnc = static_cast<int>(HostEncoderConfig::HEC_AUTO);
     }
     hostEncoderConfig = static_cast<HostEncoderConfig>(rawHostEnc);
+    hostEncoderOverrides = settings.value(SER_SDSHOSTENCODEROVERRIDES, QVariantMap()).toMap();
     hostAdapterOverrides = settings.value(SER_SDSHOSTADAPTERS, QVariantMap()).toMap();
     hostCaptureAdapterOverrides = settings.value(SER_SDSHOSTCAPTUREADAPTERS, QVariantMap()).toMap();
     hostAdaptiveRefinement = settings.value(SER_SDSHOSTADAPTIVEREFINEMENT, QVariantMap()).toMap();
+    hostMatchResolutionOverrides = settings.value(SER_SDSHOSTMATCHRES, QVariantMap()).toMap();
+    hostRevertResolutionOverrides = settings.value(SER_SDSHOSTREVERTRES, QVariantMap()).toMap();
+    hostGameOptimizationsOverrides = settings.value(SER_HOSTGAMEOPTS, QVariantMap()).toMap();
+    hostQuitAppAfterOverrides = settings.value(SER_HOSTQUITAPPAFTER, QVariantMap()).toMap();
+    hostPlayAudioOverrides = settings.value(SER_HOSTPLAYAUDIO, QVariantMap()).toMap();
     matchHostResolution = settings.value(SER_SDSMATCHHOSTRES, false).toBool();
     revertHostResolution = settings.value(SER_SDSREVERTHOSTRES, false).toBool();
 
@@ -412,9 +424,15 @@ void StreamingPreferences::save()
 
     // secure-desktop-stream: host encoder, per-host GPU adapter, and resolution matching
     settings.setValue(SER_SDSHOSTENCODER, static_cast<int>(hostEncoderConfig));
+    settings.setValue(SER_SDSHOSTENCODEROVERRIDES, hostEncoderOverrides);
     settings.setValue(SER_SDSHOSTADAPTERS, hostAdapterOverrides);
     settings.setValue(SER_SDSHOSTCAPTUREADAPTERS, hostCaptureAdapterOverrides);
     settings.setValue(SER_SDSHOSTADAPTIVEREFINEMENT, hostAdaptiveRefinement);
+    settings.setValue(SER_SDSHOSTMATCHRES, hostMatchResolutionOverrides);
+    settings.setValue(SER_SDSHOSTREVERTRES, hostRevertResolutionOverrides);
+    settings.setValue(SER_HOSTGAMEOPTS, hostGameOptimizationsOverrides);
+    settings.setValue(SER_HOSTQUITAPPAFTER, hostQuitAppAfterOverrides);
+    settings.setValue(SER_HOSTPLAYAUDIO, hostPlayAudioOverrides);
     settings.setValue(SER_SDSMATCHHOSTRES, matchHostResolution);
     settings.setValue(SER_SDSREVERTHOSTRES, revertHostResolution);
 }
@@ -447,7 +465,80 @@ bool updatePerHostOverride(QVariantMap& map, const QString& fingerprint, const Q
     map.insert(fingerprint, trimmed);
     return true;
 }
+
+int lookupBoolOverrideState(const QVariantMap& map, const QString& fingerprint)
+{
+    if (fingerprint.isEmpty() || !map.contains(fingerprint)) {
+        return -1;
+    }
+    return map.value(fingerprint).toBool() ? 1 : 0;
+}
+
+bool resolveBoolOverride(const QVariantMap& map, const QString& fingerprint, bool globalDefault)
+{
+    if (!fingerprint.isEmpty() && map.contains(fingerprint)) {
+        return map.value(fingerprint).toBool();
+    }
+    return globalDefault;
+}
+
+bool updateBoolOverrideState(QVariantMap& map, const QString& fingerprint, int state)
+{
+    if (fingerprint.isEmpty()) {
+        return false;
+    }
+    if (state < 0) {
+        if (!map.contains(fingerprint)) {
+            return false;
+        }
+        map.remove(fingerprint);
+        return true;
+    }
+    const bool value = (state > 0);
+    if (map.contains(fingerprint) && map.value(fingerprint).toBool() == value) {
+        return false;
+    }
+    map.insert(fingerprint, value);
+    return true;
+}
 } // namespace
+
+StreamingPreferences::HostEncoderConfig StreamingPreferences::hostEncoderForHost(const QString& fingerprint) const
+{
+    if (!fingerprint.isEmpty() && hostEncoderOverrides.contains(fingerprint)) {
+        int raw = hostEncoderOverrides.value(fingerprint).toInt();
+        if (raw >= static_cast<int>(HEC_AUTO) && raw <= static_cast<int>(HEC_SOFTWARE)) {
+            return static_cast<HostEncoderConfig>(raw);
+        }
+        return HEC_AUTO;
+    }
+    return hostEncoderConfig;
+}
+
+void StreamingPreferences::setHostEncoderForHost(const QString& fingerprint, HostEncoderConfig config)
+{
+    if (fingerprint.isEmpty()) {
+        return;
+    }
+    int clamped = static_cast<int>(config);
+    if (clamped < static_cast<int>(HEC_AUTO) || clamped > static_cast<int>(HEC_SOFTWARE)) {
+        clamped = static_cast<int>(HEC_AUTO);
+    }
+    // Remove key when matching default HEC_AUTO unless global legacy config differs
+    if (clamped == static_cast<int>(HEC_AUTO) && hostEncoderConfig == HEC_AUTO) {
+        if (!hostEncoderOverrides.contains(fingerprint)) {
+            return;
+        }
+        hostEncoderOverrides.remove(fingerprint);
+        emit hostEncoderOverridesChanged();
+        return;
+    }
+    if (hostEncoderOverrides.contains(fingerprint) && hostEncoderOverrides.value(fingerprint).toInt() == clamped) {
+        return;
+    }
+    hostEncoderOverrides.insert(fingerprint, clamped);
+    emit hostEncoderOverridesChanged();
+}
 
 QString StreamingPreferences::hostAdapterOverride(const QString& fingerprint) const
 {
@@ -499,6 +590,120 @@ void StreamingPreferences::setAdaptiveRefinementForHost(const QString& fingerpri
     }
     hostAdaptiveRefinement.insert(fingerprint, true);
     emit hostAdaptiveRefinementChanged();
+}
+
+int StreamingPreferences::matchHostResolutionOverrideState(const QString& fingerprint) const
+{
+    return lookupBoolOverrideState(hostMatchResolutionOverrides, fingerprint);
+}
+
+void StreamingPreferences::setMatchHostResolutionOverride(const QString& fingerprint, int state)
+{
+    if (updateBoolOverrideState(hostMatchResolutionOverrides, fingerprint, state)) {
+        emit hostMatchResolutionOverridesChanged();
+    }
+}
+
+bool StreamingPreferences::matchHostResolutionForHost(const QString& fingerprint) const
+{
+    return resolveBoolOverride(hostMatchResolutionOverrides, fingerprint, matchHostResolution);
+}
+
+int StreamingPreferences::revertHostResolutionOverrideState(const QString& fingerprint) const
+{
+    return lookupBoolOverrideState(hostRevertResolutionOverrides, fingerprint);
+}
+
+void StreamingPreferences::setRevertHostResolutionOverride(const QString& fingerprint, int state)
+{
+    if (updateBoolOverrideState(hostRevertResolutionOverrides, fingerprint, state)) {
+        emit hostRevertResolutionOverridesChanged();
+    }
+}
+
+bool StreamingPreferences::revertHostResolutionForHost(const QString& fingerprint) const
+{
+    return resolveBoolOverride(hostRevertResolutionOverrides, fingerprint, revertHostResolution);
+}
+
+bool StreamingPreferences::effectiveRevertHostResolutionForHost(const QString& fingerprint) const
+{
+    return matchHostResolutionForHost(fingerprint) && revertHostResolutionForHost(fingerprint);
+}
+
+int StreamingPreferences::gameOptimizationsOverrideState(const QString& fingerprint) const
+{
+    return lookupBoolOverrideState(hostGameOptimizationsOverrides, fingerprint);
+}
+
+void StreamingPreferences::setGameOptimizationsOverride(const QString& fingerprint, int state)
+{
+    if (updateBoolOverrideState(hostGameOptimizationsOverrides, fingerprint, state)) {
+        emit hostGameOptimizationsOverridesChanged();
+    }
+}
+
+bool StreamingPreferences::gameOptimizationsForHost(const QString& fingerprint) const
+{
+    return resolveBoolOverride(hostGameOptimizationsOverrides, fingerprint, gameOptimizations);
+}
+
+int StreamingPreferences::quitAppAfterOverrideState(const QString& fingerprint) const
+{
+    return lookupBoolOverrideState(hostQuitAppAfterOverrides, fingerprint);
+}
+
+void StreamingPreferences::setQuitAppAfterOverride(const QString& fingerprint, int state)
+{
+    if (updateBoolOverrideState(hostQuitAppAfterOverrides, fingerprint, state)) {
+        emit hostQuitAppAfterOverridesChanged();
+    }
+}
+
+bool StreamingPreferences::quitAppAfterForHost(const QString& fingerprint) const
+{
+    return resolveBoolOverride(hostQuitAppAfterOverrides, fingerprint, quitAppAfter);
+}
+
+int StreamingPreferences::playAudioOnHostOverrideState(const QString& fingerprint) const
+{
+    return lookupBoolOverrideState(hostPlayAudioOverrides, fingerprint);
+}
+
+void StreamingPreferences::setPlayAudioOnHostOverride(const QString& fingerprint, int state)
+{
+    if (updateBoolOverrideState(hostPlayAudioOverrides, fingerprint, state)) {
+        emit hostPlayAudioOverridesChanged();
+    }
+}
+
+bool StreamingPreferences::playAudioOnHostForHost(const QString& fingerprint) const
+{
+    return resolveBoolOverride(hostPlayAudioOverrides, fingerprint, playAudioOnHost);
+}
+
+bool StreamingPreferences::clearHostOverrides(const QString& fingerprint)
+{
+    if (fingerprint.isEmpty()) {
+        return false;
+    }
+    bool changed = false;
+    auto removeMapEntry = [&fingerprint, &changed](QVariantMap& map, auto signalFn) {
+        if (map.remove(fingerprint) > 0) {
+            signalFn();
+            changed = true;
+        }
+    };
+    removeMapEntry(hostEncoderOverrides, [this]() { emit hostEncoderOverridesChanged(); });
+    removeMapEntry(hostAdapterOverrides, [this]() { emit hostAdapterOverridesChanged(); });
+    removeMapEntry(hostCaptureAdapterOverrides, [this]() { emit hostCaptureAdapterOverridesChanged(); });
+    removeMapEntry(hostAdaptiveRefinement, [this]() { emit hostAdaptiveRefinementChanged(); });
+    removeMapEntry(hostMatchResolutionOverrides, [this]() { emit hostMatchResolutionOverridesChanged(); });
+    removeMapEntry(hostRevertResolutionOverrides, [this]() { emit hostRevertResolutionOverridesChanged(); });
+    removeMapEntry(hostGameOptimizationsOverrides, [this]() { emit hostGameOptimizationsOverridesChanged(); });
+    removeMapEntry(hostQuitAppAfterOverrides, [this]() { emit hostQuitAppAfterOverridesChanged(); });
+    removeMapEntry(hostPlayAudioOverrides, [this]() { emit hostPlayAudioOverridesChanged(); });
+    return changed;
 }
 
 void StreamingPreferences::requestMicrophonePermission()

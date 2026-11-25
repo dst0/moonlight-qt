@@ -153,6 +153,104 @@ private slots:
         prefs->save();
         prefs->reload();
         QVERIFY(!prefs->adaptiveRefinementForHost(QStringLiteral("fp_host_a")));
+
+        // Per-PC host encoder & universal host overrides (Global Default / Enabled / Disabled)
+        QSignalSpy hostEncSpy(prefs, &StreamingPreferences::hostEncoderOverridesChanged);
+        QSignalSpy matchSpy(prefs, &StreamingPreferences::hostMatchResolutionOverridesChanged);
+        QSignalSpy revertSpy(prefs, &StreamingPreferences::hostRevertResolutionOverridesChanged);
+        QSignalSpy gameOptSpy(prefs, &StreamingPreferences::hostGameOptimizationsOverridesChanged);
+        QSignalSpy quitSpy(prefs, &StreamingPreferences::hostQuitAppAfterOverridesChanged);
+        QSignalSpy audioSpy(prefs, &StreamingPreferences::hostPlayAudioOverridesChanged);
+
+        // Unset host inherits global defaults
+        prefs->hostEncoderConfig = StreamingPreferences::HEC_AUTO;
+        prefs->matchHostResolution = false;
+        prefs->revertHostResolution = true;
+        prefs->gameOptimizations = true;
+        prefs->quitAppAfter = false;
+        prefs->playAudioOnHost = false;
+        QCOMPARE(prefs->hostEncoderForHost(QStringLiteral("fp_host_a")), StreamingPreferences::HEC_AUTO);
+        QCOMPARE(prefs->matchHostResolutionOverrideState(QStringLiteral("fp_host_a")), -1);
+        QVERIFY(!prefs->matchHostResolutionForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(!prefs->effectiveRevertHostResolutionForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(prefs->gameOptimizationsForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(!prefs->quitAppAfterForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(!prefs->playAudioOnHostForHost(QStringLiteral("fp_host_a")));
+
+        // Override only host A
+        prefs->setHostEncoderForHost(QStringLiteral("fp_host_a"), StreamingPreferences::HEC_HARDWARE_VAAPI);
+        prefs->setMatchHostResolutionOverride(QStringLiteral("fp_host_a"), 1);
+        prefs->setRevertHostResolutionOverride(QStringLiteral("fp_host_a"), 1);
+        prefs->setGameOptimizationsOverride(QStringLiteral("fp_host_a"), 0);
+        prefs->setQuitAppAfterOverride(QStringLiteral("fp_host_a"), 1);
+        prefs->setPlayAudioOnHostOverride(QStringLiteral("fp_host_a"), 1);
+        QCOMPARE(hostEncSpy.count(), 1);
+        QCOMPARE(matchSpy.count(), 1);
+        QCOMPARE(revertSpy.count(), 1);
+        QCOMPARE(gameOptSpy.count(), 1);
+        QCOMPARE(quitSpy.count(), 1);
+        QCOMPARE(audioSpy.count(), 1);
+        prefs->save();
+        prefs->reload();
+
+        QCOMPARE(prefs->hostEncoderForHost(QStringLiteral("fp_host_a")), StreamingPreferences::HEC_HARDWARE_VAAPI);
+        QCOMPARE(prefs->hostEncoderForHost(QStringLiteral("fp_host_b")), StreamingPreferences::HEC_AUTO);
+        QCOMPARE(prefs->matchHostResolutionOverrideState(QStringLiteral("fp_host_a")), 1);
+        QVERIFY(prefs->matchHostResolutionForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(prefs->effectiveRevertHostResolutionForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(!prefs->matchHostResolutionForHost(QStringLiteral("fp_host_b")));
+        QCOMPARE(prefs->gameOptimizationsOverrideState(QStringLiteral("fp_host_a")), 0);
+        QVERIFY(!prefs->gameOptimizationsForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(prefs->gameOptimizationsForHost(QStringLiteral("fp_host_b")));
+        QVERIFY(prefs->quitAppAfterForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(!prefs->quitAppAfterForHost(QStringLiteral("fp_host_b")));
+        QVERIFY(prefs->playAudioOnHostForHost(QStringLiteral("fp_host_a")));
+        QVERIFY(!prefs->playAudioOnHostForHost(QStringLiteral("fp_host_b")));
+
+        // Reset back to global default (-1) and HEC_AUTO removes entries cleanly
+        prefs->setHostEncoderForHost(QStringLiteral("fp_host_a"), StreamingPreferences::HEC_AUTO);
+        prefs->setMatchHostResolutionOverride(QStringLiteral("fp_host_a"), -1);
+        prefs->setRevertHostResolutionOverride(QStringLiteral("fp_host_a"), -1);
+        prefs->setGameOptimizationsOverride(QStringLiteral("fp_host_a"), -1);
+        prefs->setQuitAppAfterOverride(QStringLiteral("fp_host_a"), -1);
+        prefs->setPlayAudioOnHostOverride(QStringLiteral("fp_host_a"), -1);
+        QCOMPARE(prefs->matchHostResolutionOverrideState(QStringLiteral("fp_host_a")), -1);
+        QVERIFY(!prefs->hostEncoderOverrides.contains(QStringLiteral("fp_host_a")));
+        QVERIFY(!prefs->hostMatchResolutionOverrides.contains(QStringLiteral("fp_host_a")));
+
+        // clearHostOverrides removes all per-PC overrides for deleted host without touching others
+        prefs->setHostEncoderForHost(QStringLiteral("fp_host_a"), StreamingPreferences::HEC_SOFTWARE);
+        prefs->setHostAdapterOverride(QStringLiteral("fp_host_a"), QStringLiteral("/dev/dri/renderD128"));
+        prefs->setHostCaptureAdapterOverride(QStringLiteral("fp_host_a"), QStringLiteral("/dev/dri/renderD129"));
+        prefs->setAdaptiveRefinementForHost(QStringLiteral("fp_host_a"), true);
+        prefs->setMatchHostResolutionOverride(QStringLiteral("fp_host_a"), 1);
+        prefs->setRevertHostResolutionOverride(QStringLiteral("fp_host_a"), 1);
+        prefs->setGameOptimizationsOverride(QStringLiteral("fp_host_a"), 0);
+        prefs->setQuitAppAfterOverride(QStringLiteral("fp_host_a"), 1);
+        prefs->setPlayAudioOnHostOverride(QStringLiteral("fp_host_a"), 1);
+
+        prefs->setHostEncoderForHost(QStringLiteral("fp_host_b"), StreamingPreferences::HEC_HARDWARE_VULKAN);
+        prefs->setAdaptiveRefinementForHost(QStringLiteral("fp_host_b"), true);
+        prefs->setMatchHostResolutionOverride(QStringLiteral("fp_host_b"), 1);
+
+        QVERIFY(prefs->clearHostOverrides(QStringLiteral("fp_host_a")));
+        QVERIFY(!prefs->clearHostOverrides(QStringLiteral("fp_host_a")));
+        prefs->save();
+        prefs->reload();
+
+        QCOMPARE(prefs->hostEncoderForHost(QStringLiteral("fp_host_a")), StreamingPreferences::HEC_AUTO);
+        QVERIFY(prefs->hostAdapterOverride(QStringLiteral("fp_host_a")).isEmpty());
+        QVERIFY(prefs->hostCaptureAdapterOverride(QStringLiteral("fp_host_a")).isEmpty());
+        QVERIFY(!prefs->adaptiveRefinementForHost(QStringLiteral("fp_host_a")));
+        QCOMPARE(prefs->matchHostResolutionOverrideState(QStringLiteral("fp_host_a")), -1);
+        QCOMPARE(prefs->revertHostResolutionOverrideState(QStringLiteral("fp_host_a")), -1);
+        QCOMPARE(prefs->gameOptimizationsOverrideState(QStringLiteral("fp_host_a")), -1);
+        QCOMPARE(prefs->quitAppAfterOverrideState(QStringLiteral("fp_host_a")), -1);
+        QCOMPARE(prefs->playAudioOnHostOverrideState(QStringLiteral("fp_host_a")), -1);
+
+        QCOMPARE(prefs->hostEncoderForHost(QStringLiteral("fp_host_b")), StreamingPreferences::HEC_HARDWARE_VULKAN);
+        QVERIFY(prefs->adaptiveRefinementForHost(QStringLiteral("fp_host_b")));
+        QCOMPARE(prefs->matchHostResolutionOverrideState(QStringLiteral("fp_host_b")), 1);
     }
 
 private:

@@ -540,7 +540,9 @@ void ComputerManager::deleteHost(NvComputer* computer)
         if (!deletedFingerprint.isEmpty()) {
             const QString fp = QString::fromLatin1(deletedFingerprint);
             auto removeFingerprint = [prefs = m_Prefs, fp]() {
-                if (prefs->fileClipboardHosts.removeAll(fp) > 0) {
+                bool changed = prefs->fileClipboardHosts.removeAll(fp) > 0;
+                changed = prefs->clearHostOverrides(fp) || changed;
+                if (changed) {
                     prefs->save();
                 }
             };

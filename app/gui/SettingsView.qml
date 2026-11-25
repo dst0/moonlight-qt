@@ -10,7 +10,7 @@ import SystemProperties 1.0
 
 Flickable {
     id: settingsPage
-    objectName: qsTr("Settings")
+    objectName: qsTr("Global Settings")
 
     signal languageChanged()
 
@@ -82,6 +82,9 @@ Flickable {
 
     StackView.onDeactivating: {
         SdlGamepadKeyNavigation.setUiNavMode(false)
+        adaptiveHintHoverTimer.stop()
+        adaptiveHintButton.pinned = false
+        adaptiveHintToolTip.close()
 
         // Save the prefs so the Session can observe the changes
         StreamingPreferences.save()
@@ -99,12 +102,10 @@ Flickable {
         width: settingsPage.width / 2
         spacing: 15
 
-        GroupBox {
+        SettingsGroupBox {
             id: basicSettingsGroupBox
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<font color=\"skyblue\">" + qsTr("Basic Settings") + "</font>"
-            font.pointSize: 12
+            title: qsTr("Basic Settings")
 
             Column {
                 anchors.fill: parent
@@ -677,8 +678,11 @@ Flickable {
                         if (StreamingPreferences.matchHostResolution !== checked) {
                             StreamingPreferences.matchHostResolution = checked
                         }
-                        if (!checked && StreamingPreferences.revertHostResolution) {
-                            StreamingPreferences.revertHostResolution = false
+                        if (!checked) {
+                            if (StreamingPreferences.revertHostResolution) {
+                                StreamingPreferences.revertHostResolution = false
+                            }
+                            revertHostResolutionCheck.checked = false
                         }
                     }
 
@@ -918,12 +922,11 @@ Flickable {
             }
         }
 
-        GroupBox {
+        SettingsGroupBox {
 
             id: audioSettingsGroupBox
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<font color=\"skyblue\">" + qsTr("Audio Settings") + "</font>"
+            title: qsTr("Audio Settings")
             font.pointSize: 12
 
             Column {
@@ -1052,12 +1055,10 @@ Flickable {
             }
         }
 
-        GroupBox {
+        SettingsGroupBox {
             id: hostSettingsGroupBox
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<font color=\"skyblue\">" + qsTr("Host Settings") + "</font>"
-            font.pointSize: 12
+            title: qsTr("Host Settings")
 
             Column {
                 anchors.fill: parent
@@ -1092,12 +1093,10 @@ Flickable {
             }
         }
 
-        GroupBox {
+        SettingsGroupBox {
             id: uiSettingsGroupBox
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<font color=\"skyblue\">" + qsTr("UI Settings") + "</font>"
-            font.pointSize: 12
+            title: qsTr("UI Settings")
 
             Column {
                 anchors.fill: parent
@@ -1384,12 +1383,10 @@ Flickable {
         width: settingsPage.width / 2
         spacing: 15
 
-        GroupBox {
+        SettingsGroupBox {
             id: inputSettingsGroupBox
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<font color=\"skyblue\">" + qsTr("Input Settings") + "</font>"
-            font.pointSize: 12
+            title: qsTr("Input Settings")
 
             Column {
                 anchors.fill: parent
@@ -1550,12 +1547,10 @@ Flickable {
             }
         }
 
-        GroupBox {
+        SettingsGroupBox {
             id: gamepadSettingsGroupBox
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<font color=\"skyblue\">" + qsTr("Gamepad Settings") + "</font>"
-            font.pointSize: 12
+            title: qsTr("Gamepad Settings")
 
             Column {
                 anchors.fill: parent
@@ -1626,12 +1621,10 @@ Flickable {
         }
 
         // secure-desktop-stream: clipboard and file transfer
-        GroupBox {
+        SettingsGroupBox {
             id: sdsSettingsGroupBox
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<font color=\"skyblue\">" + qsTr("Clipboard and File Transfer") + "</font>"
-            font.pointSize: 12
+            title: qsTr("Clipboard and File Transfer")
 
             Column {
                 anchors.fill: parent
@@ -1701,12 +1694,10 @@ Flickable {
             }
         }
 
-        GroupBox {
+        SettingsGroupBox {
             id: advancedSettingsGroupBox
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<font color=\"skyblue\">" + qsTr("Advanced Settings") + "</font>"
-            font.pointSize: 12
+            title: qsTr("Advanced Settings")
 
             Column {
                 anchors.fill: parent
@@ -1873,164 +1864,178 @@ Flickable {
                     }
                 }
 
-                Label {
+                ColumnLayout {
                     width: parent.width
-                    id: hostEncoderTitle
-                    text: qsTr("Host video encoder")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
+                    spacing: 0
 
-                AutoResizingComboBox {
-                    function syncHostEncoderIndex() {
-                        var saved_he = StreamingPreferences.hostEncoderConfig
-                        currentIndex = 0
-                        for (var i = 0; i < hostEncoderListModel.count; i++) {
-                            if (saved_he === hostEncoderListModel.get(i).val) {
-                                currentIndex = i
-                                break
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+
+                        CheckBox {
+                            id: enableYUV444
+                            text: qsTr("Enable YUV 4:4:4")
+                            font.pointSize: 12
+
+                            checked: StreamingPreferences.enableYUV444
+                            onCheckedChanged: {
+                                // This is called on init, so only reset to default bitrate when checked state changes.
+                                if (StreamingPreferences.enableYUV444 != checked) {
+                                    StreamingPreferences.enableYUV444 = checked
+                                    if (StreamingPreferences.autoAdjustBitrate) {
+                                        StreamingPreferences.bitrateKbps = StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
+                                                                                                                  StreamingPreferences.height,
+                                                                                                                  StreamingPreferences.fps,
+                                                                                                                  StreamingPreferences.enableYUV444);
+                                        slider.value = StreamingPreferences.bitrateKbps
+                                    }
+                                }
+                            }
+
+                            ToolTip.delay: 1000
+                            ToolTip.timeout: 5000
+                            ToolTip.visible: hovered
+                            ToolTip.text: enabled ?
+                                              qsTr("Good for streaming desktop and text-heavy games, but not recommended for fast-paced games.")
+                                            :
+                                              qsTr("YUV 4:4:4 is not supported on this PC.")
+                        }
+
+                        Rectangle {
+                            id: adaptiveHintButton
+                            visible: SystemProperties.isDarwin
+                            Layout.alignment: Qt.AlignVCenter
+                            width: 18
+                            height: 18
+                            radius: 9
+                            color: adaptiveHintMouse.containsMouse || pinned ? window.theme.accentHoverBg : "transparent"
+                            border.width: 1
+                            border.color: adaptiveHintMouse.containsMouse || pinned ? window.theme.accent : window.theme.textSecondary
+
+                            property bool pinned: false
+
+                            Label {
+                                anchors.centerIn: parent
+                                text: "i"
+                                color: adaptiveHintMouse.containsMouse || adaptiveHintButton.pinned ? window.theme.accent : window.theme.textSecondary
+                                font.bold: true
+                                font.pointSize: 9
+                            }
+
+                            Timer {
+                                id: adaptiveHintHoverTimer
+                                interval: 150
+                                onTriggered: {
+                                    if (adaptiveHintMouse.containsMouse && !adaptiveHintToolTip.opened) {
+                                        adaptiveHintToolTip.open()
+                                    }
+                                }
+                            }
+
+                            MouseArea {
+                                id: adaptiveHintMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onEntered: {
+                                    if (!adaptiveHintButton.pinned) {
+                                        adaptiveHintHoverTimer.restart()
+                                    }
+                                }
+                                onExited: {
+                                    adaptiveHintHoverTimer.stop()
+                                    if (!adaptiveHintButton.pinned) {
+                                        adaptiveHintToolTip.close()
+                                    }
+                                }
+                                onClicked: {
+                                    adaptiveHintHoverTimer.stop()
+                                    if (adaptiveHintButton.pinned) {
+                                        adaptiveHintButton.pinned = false
+                                        adaptiveHintToolTip.close()
+                                    } else {
+                                        adaptiveHintButton.pinned = true
+                                        adaptiveHintToolTip.open()
+                                    }
+                                }
+                            }
+
+                            Text {
+                                id: adaptiveHintTextHelper
+                                visible: false
+                                font: adaptiveHintToolTip.font
+                                text: adaptiveHintToolTip.text
+                            }
+
+                            ToolTip {
+                                id: adaptiveHintToolTip
+                                parent: adaptiveHintButton
+                                timeout: -1
+                                closePolicy: adaptiveHintButton.pinned
+                                             ? (Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent)
+                                             : Popup.NoAutoClose
+                                contentWidth: Math.min(adaptiveHintTextHelper.width, 380)
+                                text: qsTr("For fast 4:2:0 motion with lossless RGB text in IDEs/desktops, enable \"Adaptive dirty-tile lossless refinement\" per PC: click the gear icon on a paired PC card (or Right-Click -> PC Settings...) before connecting.")
+                                onClosed: adaptiveHintButton.pinned = false
                             }
                         }
-                    }
 
-                    Component.onCompleted: {
-                        syncHostEncoderIndex()
-                        activated(currentIndex)
-                    }
-
-                    Connections {
-                        target: StreamingPreferences
-                        function onHostEncoderConfigChanged() {
-                            hostEncoderComboBox.syncHostEncoderIndex()
+                        Item {
+                            Layout.fillWidth: true
                         }
                     }
 
-                    id: hostEncoderComboBox
-                    textRole: "text"
-                    model: ListModel {
-                        id: hostEncoderListModel
-                        ListElement {
-                            text: qsTr("Automatic (Host default)")
-                            val: StreamingPreferences.HEC_AUTO
-                        }
-                        ListElement {
-                            text: qsTr("Hardware (VAAPI / GPU)")
-                            val: StreamingPreferences.HEC_HARDWARE_VAAPI
-                        }
-                        ListElement {
-                            text: qsTr("Hardware (Vulkan)")
-                            val: StreamingPreferences.HEC_HARDWARE_VULKAN
-                        }
-                        ListElement {
-                            text: qsTr("Software (CPU — enables YUV 4:4:4)")
-                            val: StreamingPreferences.HEC_SOFTWARE
-                        }
-                    }
-                    onActivated: {
-                        if (enabled) {
-                            var selectedVal = hostEncoderListModel.get(currentIndex).val
-                            if (StreamingPreferences.hostEncoderConfig !== selectedVal) {
-                                StreamingPreferences.hostEncoderConfig = selectedVal
+                    Label {
+                        id: yuv444StatusLabel
+                        Layout.fillWidth: true
+                        Layout.leftMargin: enableYUV444.indicator ? (enableYUV444.leftPadding + enableYUV444.indicator.width + enableYUV444.spacing) : 32
+                        Layout.topMargin: -8
+                        Layout.bottomMargin: 4
+                        font.pointSize: 10
+                        wrapMode: Text.Wrap
+                        visible: enableYUV444.checked && text.length > 0
+
+                        readonly property bool hdrActive: enableHdr.checked
+                        readonly property bool badCodec: StreamingPreferences.videoCodecConfig === StreamingPreferences.VCC_FORCE_H264 ||
+                                                         StreamingPreferences.videoCodecConfig === StreamingPreferences.VCC_FORCE_AV1
+                        readonly property bool badRenderer: SystemProperties.isDarwin &&
+                                                            StreamingPreferences.rendererSelection !== StreamingPreferences.RS_AUTO &&
+                                                            StreamingPreferences.rendererSelection !== StreamingPreferences.RS_METAL
+                        readonly property int packedTileW: Math.floor((StreamingPreferences.width + 63) / 64) * 64
+                        readonly property int packedHalfW: Math.floor((Math.floor((StreamingPreferences.width + 1) / 2) + 63) / 64) * 64
+                        readonly property int packedTileH: Math.floor((StreamingPreferences.height + 63) / 64) * 64
+                        readonly property bool packedResTooSmall: StreamingPreferences.width < 64 || StreamingPreferences.height < 64
+                        readonly property bool packedResExceeds4K: (packedTileW + packedHalfW) > 8192 || (2 * packedTileH) > 4352
+                        readonly property bool hasWarning: hdrActive || badCodec || badRenderer || packedResTooSmall || packedResExceeds4K
+
+                        color: hasWarning ? window.theme.warningText : window.theme.infoText
+                        text: {
+                            if (!enableYUV444.checked) {
+                                return ""
                             }
-                        }
-                    }
-                }
-
-                CheckBox {
-                    id: enableYUV444
-                    width: parent.width
-                    text: qsTr("Enable YUV 4:4:4")
-                    font.pointSize: 12
-
-                    checked: StreamingPreferences.enableYUV444
-                    onCheckedChanged: {
-                        // This is called on init, so only reset to default bitrate when checked state changes.
-                        if (StreamingPreferences.enableYUV444 != checked) {
-                            StreamingPreferences.enableYUV444 = checked
-                            if (StreamingPreferences.autoAdjustBitrate) {
-                                StreamingPreferences.bitrateKbps = StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
-                                                                                                          StreamingPreferences.height,
-                                                                                                          StreamingPreferences.fps,
-                                                                                                          StreamingPreferences.enableYUV444);
-                                slider.value = StreamingPreferences.bitrateKbps
+                            var warnings = []
+                            if (hdrActive) {
+                                warnings.push(qsTr("Packed hardware 4:4:4 (used on hosts without native 4:4:4) cannot be combined with HDR and will stream 10-bit HDR 4:2:0."))
                             }
+                            if (badCodec) {
+                                warnings.push(qsTr("Packed hardware 4:4:4 requires Automatic or HEVC codec; forcing H.264/AV1 falls back to 4:2:0 on hosts without native 4:4:4."))
+                            }
+                            if (badRenderer) {
+                                warnings.push(qsTr("Packed hardware 4:4:4 requires Automatic or Metal renderer on macOS; Vulkan/AVSampleBufferDisplayLayer falls back to 4:2:0 on hosts without native 4:4:4."))
+                            }
+                            if (packedResTooSmall) {
+                                warnings.push(qsTr("Selected resolution is below the 64x64 minimum for packed hardware 4:4:4."))
+                            } else if (packedResExceeds4K) {
+                                warnings.push(qsTr("Selected resolution exceeds the default 4K (3840x2160) limit for packed hardware 4:4:4 on hosts without native 4:4:4."))
+                            }
+                            if (warnings.length > 0) {
+                                return warnings.join("\n")
+                            }
+                            return SystemProperties.isDarwin
+                                ? qsTr("Uses native 4:4:4 when the host supports it, or packed 10-bit HEVC YCoCg-R 4:4:4 via Metal on compatible hosts (4:2:0 fallback on legacy hosts).")
+                                : qsTr("Uses native 4:4:4 when the host supports it (falls back to 4:2:0 on unsupported hosts).")
                         }
                     }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: enabled ?
-                                      qsTr("Good for streaming desktop and text-heavy games, but not recommended for fast-paced games.")
-                                    :
-                                      qsTr("YUV 4:4:4 is not supported on this PC.")
-                }
-
-                Label {
-                    id: yuv444StatusLabel
-                    width: parent.width
-                    leftPadding: 28
-                    font.pointSize: 10
-                    wrapMode: Text.Wrap
-                    visible: enableYUV444.checked && text.length > 0
-
-                    readonly property bool hostSwEncoder: StreamingPreferences.hostEncoderConfig === StreamingPreferences.HEC_SOFTWARE
-                    readonly property bool hostVulkanEncoder: StreamingPreferences.hostEncoderConfig === StreamingPreferences.HEC_HARDWARE_VULKAN
-                    readonly property bool hdrActive: enableHdr.checked
-                    readonly property bool badCodec: StreamingPreferences.videoCodecConfig === StreamingPreferences.VCC_FORCE_H264 ||
-                                                     StreamingPreferences.videoCodecConfig === StreamingPreferences.VCC_FORCE_AV1
-                    readonly property bool badRenderer: SystemProperties.isDarwin &&
-                                                        StreamingPreferences.rendererSelection !== StreamingPreferences.RS_AUTO &&
-                                                        StreamingPreferences.rendererSelection !== StreamingPreferences.RS_METAL
-                    readonly property int packedTileW: Math.floor((StreamingPreferences.width + 63) / 64) * 64
-                    readonly property int packedHalfW: Math.floor((Math.floor((StreamingPreferences.width + 1) / 2) + 63) / 64) * 64
-                    readonly property int packedTileH: Math.floor((StreamingPreferences.height + 63) / 64) * 64
-                    readonly property bool packedResTooSmall: StreamingPreferences.width < 64 || StreamingPreferences.height < 64
-                    readonly property bool packedResExceeds4K: (packedTileW + packedHalfW) > 8192 || (2 * packedTileH) > 4352
-                    readonly property bool hasWarning: !hostSwEncoder && (hostVulkanEncoder || hdrActive || badCodec || badRenderer || packedResTooSmall || packedResExceeds4K)
-
-                    color: hasWarning ? "#ffcc66" : "#8fbce6"
-                    text: {
-                        if (!enableYUV444.checked) {
-                            return ""
-                        }
-                        if (hostSwEncoder) {
-                            return qsTr("Host Software (CPU) encoder selected: uses native 4:4:4 directly (H.264 / HEVC).")
-                        }
-                        var warnings = []
-                        if (hostVulkanEncoder) {
-                            warnings.push(qsTr("Packed hardware 4:4:4 requires Automatic or VAAPI host encoder; Vulkan host encoder falls back to 4:2:0 on hosts without native 4:4:4."))
-                        }
-                        if (hdrActive) {
-                            warnings.push(qsTr("Packed hardware 4:4:4 (used on hosts without native 4:4:4) cannot be combined with HDR and will stream 10-bit HDR 4:2:0."))
-                        }
-                        if (badCodec) {
-                            warnings.push(qsTr("Packed hardware 4:4:4 requires Automatic or HEVC codec; forcing H.264/AV1 falls back to 4:2:0 on hosts without native 4:4:4."))
-                        }
-                        if (badRenderer) {
-                            warnings.push(qsTr("Packed hardware 4:4:4 requires Automatic or Metal renderer on macOS; Vulkan/AVSampleBufferDisplayLayer falls back to 4:2:0 on hosts without native 4:4:4."))
-                        }
-                        if (packedResTooSmall) {
-                            warnings.push(qsTr("Selected resolution is below the 64x64 minimum for packed hardware 4:4:4."))
-                        } else if (packedResExceeds4K) {
-                            warnings.push(qsTr("Selected resolution exceeds the default 4K (3840x2160) limit for packed hardware 4:4:4 on hosts without native 4:4:4."))
-                        }
-                        if (warnings.length > 0) {
-                            return warnings.join("\n")
-                        }
-                        return SystemProperties.isDarwin
-                            ? qsTr("Uses native 4:4:4 when the host supports it, or packed 10-bit HEVC YCoCg-R 4:4:4 via Metal on compatible hosts (4:2:0 fallback on legacy hosts).")
-                            : qsTr("Uses native 4:4:4 when the host supports it (falls back to 4:2:0 on unsupported hosts).")
-                    }
-                }
-
-                Label {
-                    width: parent.width
-                    wrapMode: Text.WordWrap
-                    font.pointSize: Math.max(8, Qt.application.font.pointSize - 1)
-                    color: "#8fbce6"
-                    visible: SystemProperties.isDarwin
-                    text: qsTr("Tip (\u24D8): For fast 4:2:0 motion with lossless RGB text in IDEs/desktops, enable Adaptive dirty-tile lossless refinement per PC via Right-Click -> Connection Settings... before connecting.")
                 }
 
                 CheckBox {

@@ -3,6 +3,7 @@
 
 #include <QGuiApplication>
 #include <QLibraryInfo>
+#include <QStyleHints>
 
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
@@ -103,6 +104,25 @@ SystemProperties::SystemProperties()
     rendererAlwaysFullScreen = false;
     supportsHdr = true;
     maximumResolution = QSize(0, 0);
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    if (QGuiApplication::styleHints()) {
+        connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged,
+                this, [this](Qt::ColorScheme) {
+            emit systemDarkModeChanged();
+        });
+    }
+#endif
+}
+
+bool SystemProperties::systemDarkMode() const
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    if (QGuiApplication::styleHints()) {
+        return QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
+    }
+#endif
+    return false;
 }
 
 SystemProperties::~SystemProperties()
