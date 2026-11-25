@@ -2445,7 +2445,7 @@ void Session::exec()
                         m_PendingDropFiles.append(droppedPath);
                     }
                     else {
-                        m_PendingDropFiles = {droppedPath};
+                        m_PendingDropFiles = QStringList(droppedPath);
                     }
                 }
                 SDL_free(event.drop.file);
