@@ -186,6 +186,14 @@ private slots:
         // Oversized (> 256 KiB)
         QByteArray tooBig(AdaptiveRefinementWire::MAX_BATCH_BYTES + 1, '\0');
         QVERIFY(!parseTileRefinementBatch(tooBig, RefinementColorspace::Rec601, true, batch));
+
+        // Zero-length payload parses as a tile clear/invalidation record with empty rgba
+        const QByteArray clearBin = buildBatchBinary(0, 1900, 1060, {{{1856, 1024, tileW, tileH}}}, {{}});
+        QVERIFY(parseTileRefinementBatch(clearBin, RefinementColorspace::Rec709, false, batch));
+        QVERIFY(batch.valid);
+        QCOMPARE(batch.tiles.size(), std::size_t(1));
+        QVERIFY(batch.tiles[0].isClear);
+        QVERIFY(batch.tiles[0].rgba.isEmpty());
     }
 
     void inboxCoalescesCapsAndRecomputesColorimetry()
@@ -242,6 +250,22 @@ private slots:
         QCOMPARE(fw, std::uint16_t(1280));
         QCOMPARE(fh, std::uint16_t(720));
         QCOMPARE(outTiles.size(), std::size_t(1));
+
+        // Clear record coalesces over queued data tile, and subsequent data overrides clear
+        AdaptiveTileBatch bData;
+        QVERIFY(parseTileRefinementBatch(
+            buildBatchBinary(0, 1280, 720, {{{64, 0, 64, 64}}}, {qoiB}),
+            RefinementColorspace::Rec709, false, bData));
+        inbox.pushBatch(std::move(bData));
+        AdaptiveTileBatch bClear;
+        QVERIFY(parseTileRefinementBatch(
+            buildBatchBinary(0, 1280, 720, {{{64, 0, 64, 64}}}, {{}}),
+            RefinementColorspace::Rec709, false, bClear));
+        inbox.pushBatch(std::move(bClear));
+        QVERIFY(inbox.takePending(resetAll, fw, fh, outTiles, RefinementColorspace::Rec709, false));
+        QCOMPARE(outTiles.size(), std::size_t(1));
+        QVERIFY(outTiles[0].isClear);
+        QVERIFY(outTiles[0].rgba.isEmpty());
     }
 
     void resolveDecisionEnforcesAllSettingsEdgeCases()

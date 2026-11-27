@@ -53,6 +53,8 @@ struct RefinementParams
     float yTol;
     uint32_t enabled;
     simd_uint2 logicalSize;
+    uint32_t isScaled;
+    uint32_t tileValidated;
 };
 
 struct Vertex
@@ -107,8 +109,10 @@ public:
           m_LastPackedYCoCgRMode(-1),
           m_PackedLayout{},
           m_AdaptiveTileRefinement(false),
+          m_TileValidatePipelineState(nullptr),
           m_RefinementTexture(nullptr),
           m_RefinementMaskTexture(nullptr),
+          m_EffectiveMaskTexture(nullptr),
           m_FallbackRefTex(nullptr),
           m_FallbackMaskTex(nullptr),
           m_RefTexWidth(0),
@@ -171,6 +175,11 @@ public:
             CFRelease(m_TextureCache);
         }
 
+        if (m_TileValidatePipelineState != nullptr) {
+            [m_TileValidatePipelineState release];
+            m_TileValidatePipelineState = nullptr;
+        }
+
         if (m_RefinementTexture != nullptr) {
             [m_RefinementTexture release];
             m_RefinementTexture = nullptr;
@@ -179,6 +188,11 @@ public:
         if (m_RefinementMaskTexture != nullptr) {
             [m_RefinementMaskTexture release];
             m_RefinementMaskTexture = nullptr;
+        }
+
+        if (m_EffectiveMaskTexture != nullptr) {
+            [m_EffectiveMaskTexture release];
+            m_EffectiveMaskTexture = nullptr;
         }
 
         if (m_FallbackRefTex != nullptr) {
@@ -674,7 +688,7 @@ public:
         if (width <= 0 || height <= 0 || !m_MetalLayer || !m_MetalLayer.device) {
             return false;
         }
-        if (m_RefinementTexture && m_RefinementMaskTexture &&
+        if (m_RefinementTexture && m_RefinementMaskTexture && m_EffectiveMaskTexture &&
             m_RefTexWidth == width && m_RefTexHeight == height) {
             return true;
         }
@@ -683,6 +697,8 @@ public:
         m_RefinementTexture = nullptr;
         [m_RefinementMaskTexture release];
         m_RefinementMaskTexture = nullptr;
+        [m_EffectiveMaskTexture release];
+        m_EffectiveMaskTexture = nullptr;
         m_RefTexWidth = 0;
         m_RefTexHeight = 0;
 
@@ -712,6 +728,21 @@ public:
         maskDesc.usage = MTLTextureUsageShaderRead;
         m_RefinementMaskTexture = [m_MetalLayer.device newTextureWithDescriptor:maskDesc];
         if (!m_RefinementMaskTexture) {
+            [m_RefinementTexture release];
+            m_RefinementTexture = nullptr;
+            return false;
+        }
+
+        auto effMaskDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                                              width:(NSUInteger)tilesX
+                                                                             height:(NSUInteger)tilesY
+                                                                          mipmapped:NO];
+        effMaskDesc.storageMode = MTLStorageModePrivate;
+        effMaskDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        m_EffectiveMaskTexture = [m_MetalLayer.device newTextureWithDescriptor:effMaskDesc];
+        if (!m_EffectiveMaskTexture) {
+            [m_RefinementMaskTexture release];
+            m_RefinementMaskTexture = nullptr;
             [m_RefinementTexture release];
             m_RefinementTexture = nullptr;
             return false;
@@ -780,23 +811,34 @@ public:
                         (tile.x % AdaptiveRefinementWire::TILE_SIZE) != 0 ||
                         (tile.y % AdaptiveRefinementWire::TILE_SIZE) != 0 ||
                         (int)tile.x + (int)tile.w > frame->width ||
-                        (int)tile.y + (int)tile.h > frame->height ||
-                        tile.rgba.size() != (int)tile.w * (int)tile.h * 4) {
+                        (int)tile.y + (int)tile.h > frame->height) {
+                        continue;
+                    }
+                    const NSUInteger tx = tile.x / AdaptiveRefinementWire::TILE_SIZE;
+                    const NSUInteger ty = tile.y / AdaptiveRefinementWire::TILE_SIZE;
+                    if (tx >= tilesX || ty >= tilesY) {
+                        continue;
+                    }
+                    if (tile.isClear) {
+                        const uint8_t maskOff = 0;
+                        [m_RefinementMaskTexture replaceRegion:MTLRegionMake2D(tx, ty, 1, 1)
+                                                   mipmapLevel:0
+                                                     withBytes:&maskOff
+                                                   bytesPerRow:1];
+                        continue;
+                    }
+                    if (tile.rgba.size() != (int)tile.w * (int)tile.h * 4) {
                         continue;
                     }
                     [m_RefinementTexture replaceRegion:MTLRegionMake2D(tile.x, tile.y, tile.w, tile.h)
                                            mipmapLevel:0
                                              withBytes:tile.rgba.constData()
                                            bytesPerRow:(NSUInteger)tile.w * 4u];
-                    const NSUInteger tx = tile.x / AdaptiveRefinementWire::TILE_SIZE;
-                    const NSUInteger ty = tile.y / AdaptiveRefinementWire::TILE_SIZE;
-                    if (tx < tilesX && ty < tilesY) {
-                        const uint8_t maskOn = 255;
-                        [m_RefinementMaskTexture replaceRegion:MTLRegionMake2D(tx, ty, 1, 1)
-                                                   mipmapLevel:0
-                                                     withBytes:&maskOn
-                                                   bytesPerRow:1];
-                    }
+                    const uint8_t maskOn = 255;
+                    [m_RefinementMaskTexture replaceRegion:MTLRegionMake2D(tx, ty, 1, 1)
+                                               mipmapLevel:0
+                                                 withBytes:&maskOn
+                                               bytesPerRow:1];
                 }
             }
         }
@@ -819,6 +861,7 @@ public:
         SDL_assert(planes <= MAX_VIDEO_PLANES);
 
         id<MTLTexture> swLumaTex = nil;
+        id<MTLTexture> swPlanes[MAX_VIDEO_PLANES] = {};
         if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
             if (!createTexturesFromFrame(frame, cvMetalTextures)) {
                 return;
@@ -830,18 +873,97 @@ public:
                 return;
             }
         }
+        else {
+            for (size_t i = 0; i < planes; i++) {
+                swPlanes[i] = mapPlaneForSoftwareFrame(frame, i);
+                if (!swPlanes[i]) {
+                    return;
+                }
+            }
+        }
 
-        // Prepare a render pass to render into the next drawable
+        // Prepare refinement state & compute validation before the render pass
         const bool refReady = (m_PackedYCoCgRMode == 0 && m_AdaptiveTileRefinement)
             ? syncRefinementForFrame(frame)
             : false;
+
+        id<MTLTexture> lumaPlaneTex = nil;
+        if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+            lumaPlaneTex = CVMetalTextureGetTexture(cvMetalTextures[0]);
+        } else if (m_PackedYCoCgRMode == 1) {
+            lumaPlaneTex = swLumaTex;
+        } else {
+            lumaPlaneTex = swPlanes[0];
+        }
+
+        RefinementParams refParams = {};
+        id<MTLTexture> bindRef = nil;
+        id<MTLTexture> bindMask = nil;
+        bool runComputeValidation = false;
+        const bool hasRefinementBindings = (m_PackedYCoCgRMode == 0 && m_AdaptiveTileRefinement && (planes == 2 || planes == 3));
+        if (hasRefinementBindings) {
+            refParams.yTol = 8.5f / 255.0f;
+            refParams.logicalSize = simd_make_uint2((uint32_t)frame->width, (uint32_t)frame->height);
+            refParams.isScaled = (m_LastRenderWidth != frame->width || m_LastRenderHeight != frame->height) ? 1u : 0u;
+            if (refReady && m_RefinementTexture && m_RefinementMaskTexture) {
+                if (m_TileValidatePipelineState && m_EffectiveMaskTexture && m_CscParamsBuffer && lumaPlaneTex) {
+                    runComputeValidation = true;
+                    refParams.enabled = 1u;
+                    refParams.tileValidated = 1u;
+                    bindRef = m_RefinementTexture;
+                    bindMask = m_EffectiveMaskTexture;
+                } else {
+                    refParams.enabled = 1u;
+                    refParams.tileValidated = 0u;
+                    bindRef = m_RefinementTexture;
+                    bindMask = m_RefinementMaskTexture;
+                }
+            } else if (ensureFallbackRefinementTextures()) {
+                refParams.enabled = 0u;
+                refParams.tileValidated = 0u;
+                bindRef = m_FallbackRefTex;
+                bindMask = m_FallbackMaskTex;
+            }
+            if (!bindRef || !bindMask) {
+                if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+                    for (size_t i = 0; i < planes; i++) {
+                        CFRelease(cvMetalTextures[i]);
+                    }
+                }
+                return;
+            }
+        }
+
+        auto commandBuffer = [m_CommandQueue commandBuffer];
+        if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+            [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+                // Free textures after completion of rendering per CVMetalTextureCache requirements
+                for (size_t i = 0; i < planes; i++) {
+                    CFRelease(cvMetalTextures[i]);
+                }
+            }];
+        }
+
+        if (runComputeValidation) {
+            auto computeEncoder = [commandBuffer computeCommandEncoder];
+            [computeEncoder setComputePipelineState:m_TileValidatePipelineState];
+            [computeEncoder setBuffer:m_CscParamsBuffer offset:0 atIndex:0];
+            [computeEncoder setBytes:&refParams length:sizeof(refParams) atIndex:1];
+            [computeEncoder setTexture:lumaPlaneTex atIndex:0];
+            [computeEncoder setTexture:m_RefinementTexture atIndex:1];
+            [computeEncoder setTexture:m_RefinementMaskTexture atIndex:2];
+            [computeEncoder setTexture:m_EffectiveMaskTexture atIndex:3];
+            MTLSize threadgroupSize = MTLSizeMake(8, 8, 1);
+            MTLSize threadgroupCount = MTLSizeMake(m_EffectiveMaskTexture.width, m_EffectiveMaskTexture.height, 1);
+            [computeEncoder dispatchThreadgroups:threadgroupCount threadsPerThreadgroup:threadgroupSize];
+            [computeEncoder endEncoding];
+        }
 
         auto renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
         renderPassDescriptor.colorAttachments[0].texture = drawable.texture;
         renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
         renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
         renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
-        auto commandBuffer = [m_CommandQueue commandBuffer];
         auto renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
 
         // Bind textures and buffers then draw the video region
@@ -855,19 +977,13 @@ public:
                     [renderEncoder setFragmentTexture:CVMetalTextureGetTexture(cvMetalTextures[i]) atIndex:i];
                 }
             }
-            [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
-                // Free textures after completion of rendering per CVMetalTextureCache requirements
-                for (size_t i = 0; i < planes; i++) {
-                    CFRelease(cvMetalTextures[i]);
-                }
-            }];
         }
         else if (m_PackedYCoCgRMode == 1) {
             [renderEncoder setFragmentTexture:swLumaTex atIndex:0];
         }
         else {
             for (size_t i = 0; i < planes; i++) {
-                [renderEncoder setFragmentTexture:mapPlaneForSoftwareFrame(frame, i) atIndex:i];
+                [renderEncoder setFragmentTexture:swPlanes[i] atIndex:i];
             }
         }
 
@@ -884,27 +1000,9 @@ public:
         }
         else {
             [renderEncoder setFragmentBuffer:m_CscParamsBuffer offset:0 atIndex:0];
-            if (m_AdaptiveTileRefinement && (planes == 2 || planes == 3)) {
-                RefinementParams refParams = {};
-                refParams.yTol = 8.5f / 255.0f;
-                refParams.logicalSize = simd_make_uint2((uint32_t)frame->width, (uint32_t)frame->height);
+            if (hasRefinementBindings) {
                 const NSUInteger refIdx = (planes == 2) ? 2 : 3;
                 const NSUInteger maskIdx = (planes == 2) ? 3 : 4;
-                id<MTLTexture> bindRef = nil;
-                id<MTLTexture> bindMask = nil;
-                if (refReady && m_RefinementTexture && m_RefinementMaskTexture) {
-                    refParams.enabled = 1u;
-                    bindRef = m_RefinementTexture;
-                    bindMask = m_RefinementMaskTexture;
-                } else if (ensureFallbackRefinementTextures()) {
-                    refParams.enabled = 0u;
-                    bindRef = m_FallbackRefTex;
-                    bindMask = m_FallbackMaskTex;
-                }
-                if (!bindRef || !bindMask) {
-                    [renderEncoder endEncoding];
-                    return;
-                }
                 [renderEncoder setFragmentTexture:bindRef atIndex:refIdx];
                 [renderEncoder setFragmentTexture:bindMask atIndex:maskIdx];
                 [renderEncoder setFragmentBytes:&refParams length:sizeof(refParams) atIndex:1];
@@ -1140,6 +1238,19 @@ public:
                          "Failed to compile shaders: %s",
                          shaderError ? shaderError.localizedDescription.UTF8String : "unknown");
             return false;
+        }
+
+        if (m_AdaptiveTileRefinement) {
+            NSError *computeError = nil;
+            id<MTLFunction> validateFn = [[m_ShaderLibrary newFunctionWithName:@"cs_validate_tiles"] autorelease];
+            if (validateFn) {
+                m_TileValidatePipelineState = [device newComputePipelineStateWithFunction:validateFn error:&computeError];
+                if (!m_TileValidatePipelineState) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                "Failed to create adaptive tile validation pipeline state: %s",
+                                computeError ? computeError.localizedDescription.UTF8String : "unknown");
+                }
+            }
         }
 
         // Create a command queue for submission
@@ -1399,8 +1510,10 @@ private:
     PackedYCoCgRLayout m_PackedLayout;
     bool m_AdaptiveTileRefinement;
     std::shared_ptr<AdaptiveTileInbox> m_RefinementInbox;
+    id<MTLComputePipelineState> m_TileValidatePipelineState;
     id<MTLTexture> m_RefinementTexture;
     id<MTLTexture> m_RefinementMaskTexture;
+    id<MTLTexture> m_EffectiveMaskTexture;
     id<MTLTexture> m_FallbackRefTex;
     id<MTLTexture> m_FallbackMaskTex;
     int m_RefTexWidth;

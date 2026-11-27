@@ -40,6 +40,8 @@ struct RefinementParamsGpu
     float yTol;
     uint32_t enabled;
     simd_uint2 logicalSize;
+    uint32_t isScaled;
+    uint32_t tileValidated;
 };
 
 QString locateMetalShaderPath()
@@ -164,9 +166,15 @@ bool renderRefinedShaderOnGpu(bool biplanar,
                               float yTol,
                               bool enabled,
                               std::vector<uint8_t>& outBGRA,
-                              QString& errorOut)
+                              QString& errorOut,
+                              bool useComputeValidation = true,
+                              int dstWidth = 0,
+                              int dstHeight = 0)
 {
 @autoreleasepool {
+    const int renderW = (dstWidth > 0) ? dstWidth : width;
+    const int renderH = (dstHeight > 0) ? dstHeight : height;
+
     id<MTLDevice> device = [MTLCreateSystemDefaultDevice() autorelease];
     if (!device) {
         errorOut = QStringLiteral("No Metal device available");
@@ -198,9 +206,23 @@ bool renderRefinedShaderOnGpu(bool biplanar,
         return false;
     }
 
-    auto makeTex = [&](MTLPixelFormat fmt, int w, int h, MTLTextureUsage usage) -> id<MTLTexture> {
+    id<MTLComputePipelineState> computePipeline = nil;
+    if (useComputeValidation) {
+        id<MTLFunction> csFn = [[lib newFunctionWithName:@"cs_validate_tiles"] autorelease];
+        if (!csFn) {
+            errorOut = QStringLiteral("Missing cs_validate_tiles kernel");
+            return false;
+        }
+        computePipeline = [[device newComputePipelineStateWithFunction:csFn error:&err] autorelease];
+        if (!computePipeline) {
+            errorOut = QStringLiteral("Compute pipeline creation failed");
+            return false;
+        }
+    }
+
+    auto makeTex = [&](MTLPixelFormat fmt, int w, int h, MTLTextureUsage usage, MTLStorageMode mode = MTLStorageModeManaged) -> id<MTLTexture> {
         auto* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:(NSUInteger)w height:(NSUInteger)h mipmapped:NO];
-        d.storageMode = MTLStorageModeManaged;
+        d.storageMode = mode;
         d.usage = usage;
         return [[device newTextureWithDescriptor:d] autorelease];
     };
@@ -236,8 +258,15 @@ bool renderRefinedShaderOnGpu(bool biplanar,
     [refTex replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:refZero.data() bytesPerRow:width * 4];
 
     id<MTLTexture> maskTex = makeTex(MTLPixelFormatR8Unorm, tilesX, tilesY, MTLTextureUsageShaderRead);
+    id<MTLTexture> effMaskTex = makeTex(MTLPixelFormatR8Unorm, tilesX, tilesY,
+                                       MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+                                       MTLStorageModePrivate);
     std::vector<uint8_t> maskData(static_cast<size_t>(tilesX) * tilesY, 0);
     for (const AdaptiveDecodedTile& t : tiles) {
+        if (t.isClear) {
+            maskData[static_cast<size_t>(t.y / 64) * tilesX + (t.x / 64)] = 0;
+            continue;
+        }
         [refTex replaceRegion:MTLRegionMake2D(t.x, t.y, t.w, t.h)
                   mipmapLevel:0
                     withBytes:t.rgba.constData()
@@ -249,7 +278,7 @@ bool renderRefinedShaderOnGpu(bool biplanar,
     }
     [maskTex replaceRegion:MTLRegionMake2D(0, 0, tilesX, tilesY) mipmapLevel:0 withBytes:maskData.data() bytesPerRow:tilesX];
 
-    id<MTLTexture> outTex = makeTex(MTLPixelFormatBGRA8Unorm, width, height, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+    id<MTLTexture> outTex = makeTex(MTLPixelFormatBGRA8Unorm, renderW, renderH, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
 
     const MetalVertex verts[4] = {
         { { -1.0f, -1.0f, 0.0f, 1.0f }, { 0.0f, 1.0f } },
@@ -271,9 +300,26 @@ bool renderRefinedShaderOnGpu(bool biplanar,
     refP.yTol = yTol;
     refP.enabled = enabled ? 1u : 0u;
     refP.logicalSize = simd_make_uint2((uint32_t)width, (uint32_t)height);
+    refP.isScaled = (renderW != width || renderH != height) ? 1u : 0u;
+    refP.tileValidated = useComputeValidation ? 1u : 0u;
 
     id<MTLCommandQueue> queue = [[device newCommandQueue] autorelease];
     id<MTLCommandBuffer> cmd = [queue commandBuffer];
+
+    if (useComputeValidation) {
+        id<MTLComputeCommandEncoder> csEnc = [cmd computeCommandEncoder];
+        [csEnc setComputePipelineState:computePipeline];
+        [csEnc setBytes:&csc length:sizeof(csc) atIndex:0];
+        [csEnc setBytes:&refP length:sizeof(refP) atIndex:1];
+        [csEnc setTexture:yTex atIndex:0];
+        [csEnc setTexture:refTex atIndex:1];
+        [csEnc setTexture:maskTex atIndex:2];
+        [csEnc setTexture:effMaskTex atIndex:3];
+        [csEnc dispatchThreadgroups:MTLSizeMake((NSUInteger)tilesX, (NSUInteger)tilesY, 1)
+              threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [csEnc endEncoding];
+    }
+
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = outTex;
     rp.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -284,15 +330,16 @@ bool renderRefinedShaderOnGpu(bool biplanar,
     [enc setRenderPipelineState:pipeline];
     [enc setVertexBytes:verts length:sizeof(verts) atIndex:0];
     [enc setFragmentTexture:yTex atIndex:0];
+    id<MTLTexture> boundMask = useComputeValidation ? effMaskTex : maskTex;
     if (biplanar) {
         [enc setFragmentTexture:uvTex atIndex:1];
         [enc setFragmentTexture:refTex atIndex:2];
-        [enc setFragmentTexture:maskTex atIndex:3];
+        [enc setFragmentTexture:boundMask atIndex:3];
     } else {
         [enc setFragmentTexture:uTex atIndex:1];
         [enc setFragmentTexture:vTex atIndex:2];
         [enc setFragmentTexture:refTex atIndex:3];
-        [enc setFragmentTexture:maskTex atIndex:4];
+        [enc setFragmentTexture:boundMask atIndex:4];
     }
     [enc setFragmentBytes:&csc length:sizeof(csc) atIndex:0];
     [enc setFragmentBytes:&refP length:sizeof(refP) atIndex:1];
@@ -305,10 +352,10 @@ bool renderRefinedShaderOnGpu(bool biplanar,
     [cmd commit];
     [cmd waitUntilCompleted];
 
-    outBGRA.resize(static_cast<size_t>(width) * height * 4);
+    outBGRA.resize(static_cast<size_t>(renderW) * renderH * 4);
     [outTex getBytes:outBGRA.data()
-         bytesPerRow:(NSUInteger)width * 4u
-          fromRegion:MTLRegionMake2D(0, 0, width, height)
+         bytesPerRow:(NSUInteger)renderW * 4u
+          fromRegion:MTLRegionMake2D(0, 0, renderW, renderH)
          mipmapLevel:0];
     return true;
 }
@@ -503,6 +550,131 @@ void TestMetalRefinement::resetAllClearingRestoresVideoOnTriplanarI420()
     QVERIFY(std::abs(int(clearedBGRA[centerOut + 2]) - 150) <= 1);
     QVERIFY(std::abs(int(clearedBGRA[centerOut + 1]) - 150) <= 1);
     QVERIFY(std::abs(int(clearedBGRA[centerOut + 0]) - 150) <= 1);
+}
+
+void TestMetalRefinement::computeValidationKeepsStaticTextWithEdgeLumaDriftAndRejectsMotion()
+{
+    constexpr int W = 128;
+    constexpr int H = 128;
+
+    std::vector<uint8_t> rgb(static_cast<size_t>(W) * H * 3, 28);
+    drawColored1PxTextPattern(rgb, W, 0, 0, 64, 64);
+    const AdaptiveTileBatch batch = buildQoiWireBatchForRegion(rgb, W, H, {{0, 0, 64, 64}});
+    QVERIFY(batch.valid);
+
+    // 1. Simulate VAAPI/encoder edge luma ringing (+16 on 8 stroke-edge pixels within 3x3 neighborhood)
+    std::vector<uint8_t> yDrifted, uPlane, vPlane;
+    encodeDegraded420Bt601Full(rgb, W, H, yDrifted, uPlane, vPlane);
+    for (int y = 5; y < 13; ++y) {
+        // Adjacent to red 1px vertical stroke at x=6 (edge neighbor x=5 inherits +16 luma ringing)
+        yDrifted[static_cast<size_t>(y) * W + 5] = static_cast<uint8_t>(std::min(255, int(yDrifted[static_cast<size_t>(y) * W + 5]) + 16));
+    }
+
+    std::vector<uint8_t> validBGRA;
+    QString err;
+    QVERIFY2(renderRefinedShaderOnGpu(true, yDrifted, uPlane, vPlane, W, H, batch.tiles, nullptr,
+                                      8.5f / 255.0f, true, validBGRA, err, true),
+             qPrintable(err));
+    for (int py = 0; py < 64; ++py) {
+        for (int px = 0; px < 64; ++px) {
+            const size_t outIdx = (static_cast<size_t>(py) * W + px) * 4;
+            const size_t srcIdx = (static_cast<size_t>(py) * W + px) * 3;
+            QCOMPARE(validBGRA[outIdx + 2], rgb[srcIdx + 0]);
+            QCOMPARE(validBGRA[outIdx + 1], rgb[srcIdx + 1]);
+            QCOMPARE(validBGRA[outIdx + 0], rgb[srcIdx + 2]);
+        }
+    }
+
+    // 2. Simulate stale tile when a blinking caret / moved white block appears inside (0,0)
+    std::vector<uint8_t> movedRgb = rgb;
+    for (int y = 20; y < 28; ++y) {
+        for (int x = 30; x < 34; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 3;
+            movedRgb[i + 0] = 240;
+            movedRgb[i + 1] = 240;
+            movedRgb[i + 2] = 240;
+        }
+    }
+    std::vector<uint8_t> yMoved, uMoved, vMoved;
+    encodeDegraded420Bt601Full(movedRgb, W, H, yMoved, uMoved, vMoved);
+
+    std::vector<uint8_t> baselineBGRA;
+    std::vector<uint8_t> rejectedBGRA;
+    QVERIFY2(renderRefinedShaderOnGpu(true, yMoved, uMoved, vMoved, W, H, {}, nullptr,
+                                      8.5f / 255.0f, false, baselineBGRA, err, false),
+             qPrintable(err));
+    QVERIFY2(renderRefinedShaderOnGpu(true, yMoved, uMoved, vMoved, W, H, batch.tiles, nullptr,
+                                      8.5f / 255.0f, true, rejectedBGRA, err, true),
+             qPrintable(err));
+
+    // Entire tile (0,0) must be rejected cleanly with zero Swiss-cheese stale pixels
+    for (int py = 0; py < 64; ++py) {
+        for (int px = 0; px < 64; ++px) {
+            const size_t idx = (static_cast<size_t>(py) * W + px) * 4;
+            QCOMPARE(rejectedBGRA[idx + 0], baselineBGRA[idx + 0]);
+            QCOMPARE(rejectedBGRA[idx + 1], baselineBGRA[idx + 1]);
+            QCOMPARE(rejectedBGRA[idx + 2], baselineBGRA[idx + 2]);
+        }
+    }
+}
+
+void TestMetalRefinement::scaledOutputAppliesBilinearFilterWithoutNeighborBleed()
+{
+    constexpr int W = 128;
+    constexpr int H = 128;
+    constexpr int DstW = 192;
+    constexpr int DstH = 192;
+
+    std::vector<uint8_t> rgb(static_cast<size_t>(W) * H * 3, 28);
+    // Smooth horizontal gradient inside tile (0,0) and bright red unmasked garbage in tile (64,0)
+    for (int y = 0; y < 64; ++y) {
+        for (int x = 0; x < 64; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 3;
+            rgb[i + 0] = static_cast<uint8_t>(x * 4);
+            rgb[i + 1] = 80;
+            rgb[i + 2] = 160;
+        }
+    }
+    std::vector<uint8_t> yPlane, uPlane, vPlane;
+    encodeDegraded420Bt601Full(rgb, W, H, yPlane, uPlane, vPlane);
+
+    std::vector<uint8_t> refWithNeighborGarbage = rgb;
+    for (int y = 0; y < 64; ++y) {
+        for (int x = 64; x < 128; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 3;
+            refWithNeighborGarbage[i + 0] = 255;
+            refWithNeighborGarbage[i + 1] = 0;
+            refWithNeighborGarbage[i + 2] = 0;
+        }
+    }
+    const AdaptiveTileBatch garbageBatch = buildQoiWireBatchForRegion(refWithNeighborGarbage, W, H, {{0, 0, 64, 64}, {64, 0, 64, 64}});
+    QVERIFY(garbageBatch.valid);
+
+    // Mask only tile (0,0) on; leave tile (64,0) unmasked despite red garbage in refTex
+    const std::vector<uint8_t> maskOnlyTopLeft{255, 0, 0, 0};
+    std::vector<uint8_t> scaledBGRA;
+    QString err;
+    QVERIFY2(renderRefinedShaderOnGpu(true, yPlane, uPlane, vPlane, W, H, garbageBatch.tiles, &maskOnlyTopLeft,
+                                      8.5f / 255.0f, true, scaledBGRA, err, true, DstW, DstH),
+             qPrintable(err));
+
+    // At scaled border of tile (0,0) (dx = 95, norm ~ 95.5/192 * 128 = 63.67 -> between x=63 and x=64),
+    // sampleRefTap must clamp to fallback instead of bleeding red (255,0,0) from unmasked tile (64,0)
+    const size_t borderIdx = (static_cast<size_t>(30) * DstW + 95) * 4;
+    QVERIFY2(scaledBGRA[borderIdx + 2] <= 252 && scaledBGRA[borderIdx + 1] >= 70 && scaledBGRA[borderIdx + 0] >= 150,
+             qPrintable(QStringLiteral("Unexpected neighbor bleed at scaled seam: RGB=(%1,%2,%3)")
+                            .arg(scaledBGRA[borderIdx + 2]).arg(scaledBGRA[borderIdx + 1]).arg(scaledBGRA[borderIdx + 0])));
+
+    // Interior gradient must show intermediate bilinear values (not stepped multiples of 4 from nearest-neighbor)
+    bool sawInterpolated = false;
+    for (int dx = 10; dx < 80; ++dx) {
+        const size_t idx = (static_cast<size_t>(30) * DstW + dx) * 4;
+        if ((scaledBGRA[idx + 2] % 4) != 0) {
+            sawInterpolated = true;
+            break;
+        }
+    }
+    QVERIFY(sawInterpolated);
 }
 
 int runMetalRefinementTests(int argc, char** argv)

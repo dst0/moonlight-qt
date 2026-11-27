@@ -435,12 +435,21 @@ bool parseTileRefinementBatch(const QByteArray& binary,
             return false;
         }
 
+        if (payloadLen == 0) {
+            tile.isClear = true;
+            tile.colorSpace = colorSpace;
+            tile.fullRange = fullRange;
+            outBatch.tiles.push_back(std::move(tile));
+            continue;
+        }
+
         if (!decodeQoiRgb24(p + offset, payloadLen, tile.w, tile.h, scratchRgb)) {
             outBatch = AdaptiveTileBatch{};
             return false;
         }
         offset += static_cast<std::size_t>(payloadLen);
 
+        tile.isClear = false;
         fillTileRgbaFromRgb(scratchRgb, tile.w, tile.h, colorSpace, fullRange, tile.rgba);
         tile.colorSpace = colorSpace;
         tile.fullRange = fullRange;
@@ -500,9 +509,16 @@ void AdaptiveTileInbox::pushBatch(AdaptiveTileBatch&& batch)
         }
 
         while (m_Tiles.size() >= static_cast<std::size_t>(AdaptiveRefinementWire::MAX_INBOX_TILES) && !m_Order.empty()) {
-            const std::uint64_t oldest = m_Order.front();
-            m_Order.pop_front();
-            m_Tiles.erase(oldest);
+            auto evictIt = std::find_if(m_Order.begin(), m_Order.end(), [this](std::uint64_t k) {
+                auto found = m_Tiles.find(k);
+                return found != m_Tiles.end() && !found->second.isClear;
+            });
+            if (evictIt == m_Order.end()) {
+                evictIt = m_Order.begin();
+            }
+            const std::uint64_t victim = *evictIt;
+            m_Order.erase(evictIt);
+            m_Tiles.erase(victim);
         }
 
         m_Tiles.emplace(key, std::move(tile));
@@ -556,7 +572,7 @@ bool AdaptiveTileInbox::takePending(bool& outResetAll,
             continue;
         }
         auto tile = std::move(it->second);
-        if (tile.colorSpace != targetColorSpace || tile.fullRange != targetFullRange) {
+        if (!tile.isClear && (tile.colorSpace != targetColorSpace || tile.fullRange != targetFullRange)) {
             recomputeTileYRef(tile, targetColorSpace, targetFullRange);
         }
         outTiles.push_back(std::move(tile));

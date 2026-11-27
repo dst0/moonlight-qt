@@ -21,7 +21,7 @@ namespace AdaptiveRefinementWire
     inline constexpr int MAX_BATCH_BYTES = 256 * 1024;
     inline constexpr int MAX_TILE_PAYLOAD = 24 * 1024;
     inline constexpr int MAX_FRAME_DIM = 16384;
-    inline constexpr int MAX_INBOX_TILES = 256;
+    inline constexpr int MAX_INBOX_TILES = 4096;
 }
 
 enum class RefinementColorspace : int
@@ -38,7 +38,8 @@ struct AdaptiveDecodedTile
     std::uint16_t y = 0;
     std::uint16_t w = 0;
     std::uint16_t h = 0;
-    QByteArray rgba; // w * h * 4 bytes: (R, G, B, Y_ref)
+    bool isClear = false;
+    QByteArray rgba; // w * h * 4 bytes: (R, G, B, Y_ref) when !isClear
     RefinementColorspace colorSpace = RefinementColorspace::Rec601;
     bool fullRange = true;
 };
