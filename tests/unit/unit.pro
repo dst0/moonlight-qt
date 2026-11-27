@@ -44,6 +44,7 @@ SOURCES += \
     $$APP_DIR/settings/streamingpreferences.cpp \
     $$APP_DIR/path.cpp \
     $$APP_DIR/streaming/input/keymapping.cpp \
+    $$APP_DIR/streaming/bandwidth.cpp \
     $$APP_DIR/streaming/video/adaptiverefinement.cpp \
     $$APP_DIR/streaming/video/adaptiverefinement_codec.cpp \
     $$APP_DIR/streaming/video/packed444.cpp
@@ -53,6 +54,7 @@ HEADERS += \
     $$APP_DIR/backend/nvcomputer.h \
     $$APP_DIR/backend/nvhttp.h \
     $$APP_DIR/settings/streamingpreferences.h \
+    $$APP_DIR/streaming/bandwidth.h \
     $$APP_DIR/streaming/video/adaptiverefinement.h \
     $$APP_DIR/streaming/video/adaptiverefinement_codec.h \
     $$APP_DIR/streaming/video/packed444.h

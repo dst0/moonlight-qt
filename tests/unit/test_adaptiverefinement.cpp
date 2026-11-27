@@ -353,6 +353,52 @@ private slots:
             QVERIFY(d.statusNote.contains(QStringLiteral("4:4:4")));
         }
     }
+
+    void inboxTracksWireBytesAndBitrate()
+    {
+        AdaptiveTileInbox inbox;
+        QCOMPARE(inbox.bitrateWindowSeconds(), 10u);
+        QCOMPARE(inbox.peakBitrateMbps(), 0.0);
+        QCOMPARE(inbox.averageBitrateMbps(), 0.0);
+
+        // Invalid batch leaves wireBytes = 0 and records nothing
+        AdaptiveTileBatch invalidBatch;
+        QVERIFY(!parseTileRefinementBatch(QByteArrayLiteral("BAD"), RefinementColorspace::Rec601, true, invalidBatch));
+        QCOMPARE(invalidBatch.wireBytes, std::size_t(0));
+        inbox.pushBatch(std::move(invalidBatch));
+        QCOMPARE(inbox.peakBitrateMbps(), 0.0);
+
+        // Reset-only valid batch populates wireBytes accurately
+        const QByteArray resetBin = buildBatchBinary(AdaptiveRefinementWire::FLAG_RESET_ALL, 1920, 1080, {}, {});
+        AdaptiveTileBatch resetBatch;
+        QVERIFY(parseTileRefinementBatch(resetBin, RefinementColorspace::Rec601, true, resetBatch));
+        QCOMPARE(resetBatch.wireBytes, static_cast<std::size_t>(resetBin.size()));
+
+        // Tile batch populates wireBytes and immediately updates 250ms peak bitrate
+        std::vector<std::uint8_t> rgb(64 * 64 * 3);
+        for (std::size_t i = 0; i < 64 * 64; ++i) {
+            rgb[i * 3 + 0] = static_cast<std::uint8_t>((i * 37) & 0xFF);
+            rgb[i * 3 + 1] = static_cast<std::uint8_t>((i * 73) & 0xFF);
+            rgb[i * 3 + 2] = static_cast<std::uint8_t>((i * 19) & 0xFF);
+        }
+        std::vector<std::uint8_t> qoi;
+        QVERIFY(encodeQoiRgb24(rgb.data(), 64 * 3, 64, 64, qoi));
+
+        const QByteArray tileBin = buildBatchBinary(0, 1920, 1080, {{{0, 0, 64, 64}}}, {qoi});
+        AdaptiveTileBatch tileBatch;
+        QVERIFY(parseTileRefinementBatch(tileBin, RefinementColorspace::Rec601, true, tileBatch));
+        QCOMPARE(tileBatch.wireBytes, static_cast<std::size_t>(tileBin.size()));
+
+        inbox.pushBatch(std::move(tileBatch));
+        const double expectedBucketMbps = static_cast<double>(tileBin.size()) * 8.0 / 1000000.0 / 0.25;
+        const double peak = inbox.peakBitrateMbps();
+        QVERIFY(peak > 0.0);
+        QVERIFY(qAbs(peak - expectedBucketMbps) < 0.01);
+
+        // Average reflects completed 250ms buckets
+        QTest::qWait(260);
+        QVERIFY(inbox.averageBitrateMbps() > 0.0);
+    }
 };
 
 int runAdaptiveRefinementTests(int argc, char** argv)

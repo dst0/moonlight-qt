@@ -130,6 +130,7 @@ private:
     int m_LogicalWidth;
     int m_LogicalHeight;
     bool m_AdaptiveTileRefinement;
+    std::shared_ptr<AdaptiveTileInbox> m_RefinementInbox;
     int m_VideoFormat;
     bool m_NeedsSpsFixup;
     bool m_TestOnly;

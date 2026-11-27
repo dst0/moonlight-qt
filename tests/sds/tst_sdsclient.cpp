@@ -1430,6 +1430,8 @@ void TestSdsClient::tileRefinementLongPollOverPinnedMtls()
     QVERIFY(pollCount >= 2);
     QCOMPARE(seenPeerCert, m_Client.cert);
     QVERIFY(seenPaths[0].startsWith(QStringLiteral("GET /sds/v1/tile-refinement?timeout=2")));
+    QVERIFY(inbox->peakBitrateMbps() > 0.0);
+    QCOMPARE(inbox->bitrateWindowSeconds(), 10u);
 
     bool resetAll = false;
     std::uint16_t fw = 0, fh = 0;
@@ -1480,6 +1482,7 @@ void TestSdsClient::tileRefinementLongPollOverPinnedMtls()
         client.stop();
     }
     QCOMPARE(badInbox->queuedTileCount(), std::size_t(0));
+    QCOMPARE(badInbox->peakBitrateMbps(), 0.0);
     QCOMPARE(badHttpRequests, 0);
 }
 

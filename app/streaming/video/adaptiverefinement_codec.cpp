@@ -462,6 +462,7 @@ bool parseTileRefinementBatch(const QByteArray& binary,
     }
 
     outBatch.valid = true;
+    outBatch.wireBytes = totalSize;
     return true;
 }
 
@@ -483,46 +484,54 @@ void AdaptiveTileInbox::pushBatch(AdaptiveTileBatch&& batch)
         return;
     }
 
-    QMutexLocker locker(&m_Mutex);
-    const bool dimsProvided = (batch.frameW > 0 && batch.frameH > 0);
-    const bool dimsChanged = dimsProvided && m_ResetFrameW != 0 && m_ResetFrameH != 0 &&
-                             (batch.frameW != m_ResetFrameW || batch.frameH != m_ResetFrameH);
-    if (batch.resetAll || dimsChanged) {
-        m_PendingReset = true;
-        if (dimsProvided || batch.resetAll) {
+    const std::size_t wireBytes = batch.wireBytes;
+    {
+        QMutexLocker locker(&m_Mutex);
+        const bool dimsProvided = (batch.frameW > 0 && batch.frameH > 0);
+        const bool dimsChanged = dimsProvided && m_ResetFrameW != 0 && m_ResetFrameH != 0 &&
+                                 (batch.frameW != m_ResetFrameW || batch.frameH != m_ResetFrameH);
+        if (batch.resetAll || dimsChanged) {
+            m_PendingReset = true;
+            if (dimsProvided || batch.resetAll) {
+                m_ResetFrameW = batch.frameW;
+                m_ResetFrameH = batch.frameH;
+            }
+            m_Order.clear();
+            m_Tiles.clear();
+        } else if (dimsProvided && m_ResetFrameW == 0 && m_ResetFrameH == 0) {
             m_ResetFrameW = batch.frameW;
             m_ResetFrameH = batch.frameH;
         }
-        m_Order.clear();
-        m_Tiles.clear();
-    } else if (dimsProvided && m_ResetFrameW == 0 && m_ResetFrameH == 0) {
-        m_ResetFrameW = batch.frameW;
-        m_ResetFrameH = batch.frameH;
+
+        for (auto& tile : batch.tiles) {
+            const std::uint64_t key = tileKey(tile.x, tile.y);
+            auto it = m_Tiles.find(key);
+            if (it != m_Tiles.end()) {
+                it->second = std::move(tile);
+                continue;
+            }
+
+            while (m_Tiles.size() >= static_cast<std::size_t>(AdaptiveRefinementWire::MAX_INBOX_TILES) && !m_Order.empty()) {
+                auto evictIt = std::find_if(m_Order.begin(), m_Order.end(), [this](std::uint64_t k) {
+                    auto found = m_Tiles.find(k);
+                    return found != m_Tiles.end() && !found->second.isClear;
+                });
+                if (evictIt == m_Order.end()) {
+                    evictIt = m_Order.begin();
+                }
+                const std::uint64_t victim = *evictIt;
+                m_Order.erase(evictIt);
+                m_Tiles.erase(victim);
+            }
+
+            m_Tiles.emplace(key, std::move(tile));
+            m_Order.push_back(key);
+        }
     }
 
-    for (auto& tile : batch.tiles) {
-        const std::uint64_t key = tileKey(tile.x, tile.y);
-        auto it = m_Tiles.find(key);
-        if (it != m_Tiles.end()) {
-            it->second = std::move(tile);
-            continue;
-        }
-
-        while (m_Tiles.size() >= static_cast<std::size_t>(AdaptiveRefinementWire::MAX_INBOX_TILES) && !m_Order.empty()) {
-            auto evictIt = std::find_if(m_Order.begin(), m_Order.end(), [this](std::uint64_t k) {
-                auto found = m_Tiles.find(k);
-                return found != m_Tiles.end() && !found->second.isClear;
-            });
-            if (evictIt == m_Order.end()) {
-                evictIt = m_Order.begin();
-            }
-            const std::uint64_t victim = *evictIt;
-            m_Order.erase(evictIt);
-            m_Tiles.erase(victim);
-        }
-
-        m_Tiles.emplace(key, std::move(tile));
-        m_Order.push_back(key);
+    // Update bandwidth tracking outside m_Mutex to avoid nested lock acquisition.
+    if (wireBytes > 0) {
+        m_BwTracker.AddBytes(wireBytes);
     }
 }
 
@@ -586,4 +595,19 @@ std::size_t AdaptiveTileInbox::queuedTileCount() const
 {
     QMutexLocker locker(&m_Mutex);
     return m_Tiles.size();
+}
+
+double AdaptiveTileInbox::averageBitrateMbps()
+{
+    return m_BwTracker.GetAverageMbps();
+}
+
+double AdaptiveTileInbox::peakBitrateMbps()
+{
+    return m_BwTracker.GetPeakMbps();
+}
+
+unsigned int AdaptiveTileInbox::bitrateWindowSeconds()
+{
+    return m_BwTracker.GetWindowSeconds();
 }

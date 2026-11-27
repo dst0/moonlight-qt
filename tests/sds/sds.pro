@@ -32,6 +32,7 @@ SOURCES += \
     $$APP_DIR/streaming/sds/fileclipboard.cpp \
     $$APP_DIR/streaming/sds/filesanitize.cpp \
     $$APP_DIR/streaming/sds/sdscontroller.cpp \
+    $$APP_DIR/streaming/bandwidth.cpp \
     $$APP_DIR/streaming/video/adaptiverefinement_codec.cpp
 
 HEADERS += \
@@ -43,6 +44,7 @@ HEADERS += \
     $$APP_DIR/streaming/sds/filesanitize.h \
     $$APP_DIR/streaming/sds/sdscontroller.h \
     $$APP_DIR/streaming/sds/sdstypes.h \
+    $$APP_DIR/streaming/bandwidth.h \
     $$APP_DIR/streaming/video/adaptiverefinement_codec.h
 
 macx {
