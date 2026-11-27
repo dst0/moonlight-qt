@@ -181,6 +181,9 @@ Item {
 
                 // Show the tooltip for 3 seconds
                 var toast = Qt.createQmlObject('import QtQuick.Controls 2.2; ToolTip {}', parent, '')
+                if (typeof window !== "undefined" && window.applyToolTipStyle) {
+                    window.applyToolTipStyle(toast)
+                }
                 toast.timeout = 3000
                 toast.text = text
                 toast.y += yOffset

@@ -56,12 +56,35 @@ ApplicationWindow {
     Material.primary: theme.bgHeader
     Material.elevation: 0
 
+    Component {
+        id: styledToolTipBgComponent
+        Rectangle {
+            radius: 8
+            color: window.theme.isDark ? "#2d333b" : "#24292f"
+            border.width: 1
+            border.color: window.theme.isDark ? "#444c56" : "#343b46"
+        }
+    }
+
+    function applyToolTipStyle(tip) {
+        if (!tip) {
+            return
+        }
+        tip.Material.theme = Material.Dark
+        tip.Material.foreground = "#f0f6fc"
+        tip.padding = 10
+        tip.horizontalPadding = 12
+        tip.background = styledToolTipBgComponent.createObject(tip)
+    }
+
     // This function runs prior to creation of the initial StackView item
     function doEarlyInit() {
         SdlGamepadKeyNavigation.enable()
     }
 
     Component.onCompleted: {
+        applyToolTipStyle(ToolTip.toolTip)
+
         // Show the window according to the user's preferences
         if (SystemProperties.hasDesktopEnvironment) {
             if (StreamingPreferences.uiDisplayMode == StreamingPreferences.UI_MAXIMIZED) {

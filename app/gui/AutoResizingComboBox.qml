@@ -40,6 +40,10 @@ ComboBox {
         // Switch to normal navigation for combo boxes
         SdlGamepadKeyNavigation.setUiNavMode(false)
 
+        // Allow popup list to expand past a capped button width so long GPU names never truncate
+        var maxPopupWidth = (typeof window !== "undefined" && window.width) ? Math.min(560, window.width - 32) : 560
+        popup.width = Math.max(width, Math.min(desiredWidth + 24, maxPopupWidth))
+
         // Match the active Light/Dark surface palette instead of hardcoding dark grey
         if (popup.background) {
             if (typeof window !== "undefined" && window.theme) {

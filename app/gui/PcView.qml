@@ -129,11 +129,13 @@ CenteredGridView {
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.top: parent.top
             anchors.topMargin: 28
+            width: 148
+            height: 148
             source: window.tintedUrl(model.online ? window.theme.textPrimary : window.theme.textSecondary,
                                      "res/desktop_windows-48px.svg")
             sourceSize {
-                width: 164
-                height: 164
+                width: 148
+                height: 148
             }
         }
 
@@ -143,12 +145,14 @@ CenteredGridView {
             anchors.horizontalCenter: pcIcon.horizontalCenter
             anchors.verticalCenter: pcIcon.verticalCenter
             anchors.verticalCenterOffset: !model.online ? -14 : -12
+            width: !model.online ? 54 : 50
+            height: !model.online ? 54 : 50
             visible: !model.statusUnknown && (!model.online || !model.paired)
             source: window.tintedUrl(!model.online ? window.theme.warningText : window.theme.accent,
                                      !model.online ? "res/warning_FILL1_wght300_GRAD200_opsz24.svg" : "res/baseline-lock-24px.svg")
             sourceSize {
-                width: !model.online ? 60 : 56
-                height: !model.online ? 60 : 56
+                width: !model.online ? 54 : 50
+                height: !model.online ? 54 : 50
             }
         }
 
@@ -452,7 +456,7 @@ CenteredGridView {
                                                                  StreamingPreferences.rendererSelection !== StreamingPreferences.RS_AUTO &&
                                                                  StreamingPreferences.rendererSelection !== StreamingPreferences.RS_METAL)
 
-        width: Overlay.overlay ? Math.min(560, Math.max(320, Overlay.overlay.width - 40)) : 560
+        width: Overlay.overlay ? Math.min(680, Math.max(360, Overlay.overlay.width - 40)) : 680
         standardButtons: Dialog.Ok | Dialog.Cancel
 
         onOpened: {
@@ -741,7 +745,7 @@ CenteredGridView {
                                 text: adaptiveInfoToolTip.text
                             }
 
-                            ToolTip {
+                            StyledToolTip {
                                 id: adaptiveInfoToolTip
                                 parent: adaptiveInfoButton
                                 timeout: -1
@@ -811,7 +815,7 @@ CenteredGridView {
 
                         AutoResizingComboBox {
                             id: pcHostEncoderComboBox
-                            maximumWidth: 300
+                            maximumWidth: 400
                             textRole: "text"
                             model: ListModel {
                                 id: pcHostEncoderListModel
@@ -883,7 +887,7 @@ CenteredGridView {
 
                         AutoResizingComboBox {
                             id: pcAdapterComboBox
-                            maximumWidth: 300
+                            maximumWidth: 400
                             textRole: "text"
                             model: ListModel {
                                 id: pcAdapterListModel
@@ -920,7 +924,7 @@ CenteredGridView {
 
                         AutoResizingComboBox {
                             id: pcCaptureAdapterComboBox
-                            maximumWidth: 300
+                            maximumWidth: 400
                             textRole: "text"
                             model: ListModel {
                                 id: pcCaptureAdapterListModel

@@ -1967,7 +1967,7 @@ Flickable {
                                 text: adaptiveHintToolTip.text
                             }
 
-                            ToolTip {
+                            StyledToolTip {
                                 id: adaptiveHintToolTip
                                 parent: adaptiveHintButton
                                 timeout: -1

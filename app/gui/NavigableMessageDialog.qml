@@ -31,6 +31,8 @@ NavigableDialog {
 
         Image {
             id: dialogImage
+            width: 50
+            height: 50
             source: {
                 var resPath = (standardButtons & Dialog.Yes)
                               ? "res/baseline-help_outline-24px.svg"
