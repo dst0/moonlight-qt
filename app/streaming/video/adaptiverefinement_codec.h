@@ -3,6 +3,8 @@
 #include <QByteArray>
 #include <QMutex>
 
+#include "streaming/bandwidth.h"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +52,7 @@ struct AdaptiveTileBatch
     bool resetAll = false;
     std::uint16_t frameW = 0;
     std::uint16_t frameH = 0;
+    std::size_t wireBytes = 0;
     std::vector<AdaptiveDecodedTile> tiles;
 };
 
@@ -101,6 +104,21 @@ public:
 
     std::size_t queuedTileCount() const;
 
+    /**
+     * @brief Returns the recent average bitrate in Mbps for received adaptive tile batches.
+     */
+    double averageBitrateMbps();
+
+    /**
+     * @brief Returns the peak bucket bitrate in Mbps within the sliding window.
+     */
+    double peakBitrateMbps();
+
+    /**
+     * @brief Returns the sliding window duration in seconds for adaptive tile bitrate tracking.
+     */
+    unsigned int bitrateWindowSeconds();
+
 private:
     static std::uint64_t tileKey(std::uint16_t x, std::uint16_t y)
     {
@@ -113,6 +131,7 @@ private:
     std::uint16_t m_ResetFrameH = 0;
     std::deque<std::uint64_t> m_Order;
     std::unordered_map<std::uint64_t, AdaptiveDecodedTile> m_Tiles;
+    BandwidthTracker m_BwTracker{10, 250};
 
     std::atomic<int> m_Colorspace{static_cast<int>(RefinementColorspace::Rec601)};
     std::atomic<bool> m_FullRange{true};

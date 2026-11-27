@@ -1,5 +1,6 @@
 #include <Limelight.h>
 #include "ffmpeg.h"
+#include "adaptiverefinement_codec.h"
 #include "utils.h"
 #include "streaming/session.h"
 
@@ -319,6 +320,8 @@ void FFmpegVideoDecoder::reset()
         // Test-only decoders can't have any frames submitted
         SDL_assert(m_GlobalVideoStats.totalFrames == 0);
     }
+
+    m_RefinementInbox.reset();
 }
 
 bool FFmpegVideoDecoder::initializeRendererInternal(IFFmpegRenderer* renderer, PDECODER_PARAMETERS params)
@@ -505,6 +508,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     m_LogicalWidth = params->logicalWidth;
     m_LogicalHeight = params->logicalHeight;
     m_AdaptiveTileRefinement = params->adaptiveTileRefinement && (params->packedYCoCgRMode == 0);
+    m_RefinementInbox = m_AdaptiveTileRefinement ? params->refinementInbox : nullptr;
     m_StreamFps = params->frameRate;
     m_VideoFormat = params->videoFormat;
     m_CurrentTestMode = testMode;
@@ -909,7 +913,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                            length - offset,
                            "Video stream: %dx%d %.2f FPS (Codec: %s%s)\n"
 #ifdef DISPLAY_BITRATE
-                           "Bitrate: %.1f Mbps, Peak (%us): %.1f\n"
+                           "Video bitrate (UDP): %.1f Mbps, Peak (%us): %.1f Mbps\n"
 #endif
                            ,
                            displayWidth,
@@ -930,6 +934,23 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             }
 
             offset += ret;
+
+#ifdef DISPLAY_BITRATE
+            if (m_AdaptiveTileRefinement && m_RefinementInbox) {
+                ret = snprintf(&output[offset],
+                               length - offset,
+                               "Adaptive tiles (HTTPS): %.1f Mbps, Peak (%us): %.1f Mbps\n",
+                               m_RefinementInbox->averageBitrateMbps(),
+                               m_RefinementInbox->bitrateWindowSeconds(),
+                               m_RefinementInbox->peakBitrateMbps());
+                if (ret < 0 || ret >= length - offset) {
+                    SDL_assert(false);
+                    return;
+                }
+
+                offset += ret;
+            }
+#endif
         }
 
         ret = snprintf(&output[offset],
@@ -999,7 +1020,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
 {
     if (stats.renderedFps > 0 || stats.renderedFrames != 0) {
-        char videoStatsStr[512];
+        char videoStatsStr[1024];
         stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
