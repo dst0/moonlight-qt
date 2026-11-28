@@ -2,6 +2,13 @@
 
 #ifdef Q_OS_WIN32
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
 #include "lossless_hash.h"
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
@@ -11,7 +18,6 @@
 
 #include <SDL_syswm.h>
 
-#include <d3d10.h>
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
@@ -453,7 +459,7 @@ bool LosslessD3D11Renderer::initialize(SDL_Window* window,
     }
 
     // Check D3D11 runtime thread protection
-    ComPtr<ID3D10Multithread> mt;
+    ComPtr<ID3D11Multithread> mt;
     if (SUCCEEDED(m_Impl->device.As(&mt))) {
         mt->SetMultithreadProtected(TRUE);
     }
