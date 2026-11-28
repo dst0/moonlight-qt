@@ -950,7 +950,6 @@ Flickable {
                 RowLayout {
                     width: parent.width
                     spacing: 10
-                    enabled: enableLosslessModeCheck.checked
 
                     Label {
                         Layout.fillWidth: true
@@ -968,7 +967,7 @@ Flickable {
                             ListElement { text: qsTr("CPU SIMD (Software + SDL/Native)"); val: StreamingPreferences.LDM_CPU }
                         }
                         textRole: "text"
-                        Component.onCompleted: {
+                        function reinitialize() {
                             var saved = StreamingPreferences.losslessDecoderMode
                             currentIndex = 0
                             for (var i = 0; i < losslessDecoderListModel.count; i++) {
@@ -979,6 +978,10 @@ Flickable {
                             }
                             recalculateWidth()
                         }
+                        Component.onCompleted: {
+                            reinitialize()
+                            languageChanged.connect(reinitialize)
+                        }
                         onActivated: {
                             StreamingPreferences.losslessDecoderMode = losslessDecoderListModel.get(currentIndex).val
                         }
@@ -988,7 +991,6 @@ Flickable {
                 RowLayout {
                     width: parent.width
                     spacing: 10
-                    enabled: enableLosslessModeCheck.checked
 
                     Label {
                         Layout.fillWidth: true
@@ -1006,7 +1008,7 @@ Flickable {
                             ListElement { text: qsTr("Off"); val: StreamingPreferences.LHM_OFF }
                         }
                         textRole: "text"
-                        Component.onCompleted: {
+                        function reinitialize() {
                             var saved = StreamingPreferences.losslessHashMode
                             currentIndex = 0
                             for (var i = 0; i < losslessHashListModel.count; i++) {
@@ -1017,6 +1019,10 @@ Flickable {
                             }
                             recalculateWidth()
                         }
+                        Component.onCompleted: {
+                            reinitialize()
+                            languageChanged.connect(reinitialize)
+                        }
                         onActivated: {
                             StreamingPreferences.losslessHashMode = losslessHashListModel.get(currentIndex).val
                         }
@@ -1026,7 +1032,6 @@ Flickable {
                 RowLayout {
                     width: parent.width
                     spacing: 10
-                    enabled: enableLosslessModeCheck.checked
 
                     Label {
                         Layout.fillWidth: true
@@ -1044,7 +1049,7 @@ Flickable {
                             ListElement { text: qsTr("CPU SIMD"); val: StreamingPreferences.LHEM_CPU }
                         }
                         textRole: "text"
-                        Component.onCompleted: {
+                        function reinitialize() {
                             var saved = StreamingPreferences.losslessHostEncoderMode
                             currentIndex = 0
                             for (var i = 0; i < losslessHostEncListModel.count; i++) {
@@ -1054,6 +1059,10 @@ Flickable {
                                 }
                             }
                             recalculateWidth()
+                        }
+                        Component.onCompleted: {
+                            reinitialize()
+                            languageChanged.connect(reinitialize)
                         }
                         onActivated: {
                             StreamingPreferences.losslessHostEncoderMode = losslessHostEncListModel.get(currentIndex).val

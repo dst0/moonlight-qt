@@ -1426,18 +1426,13 @@ namespace sds::lossless {
       return false;
     }
 
-    const std::size_t frame_bytes = static_cast<std::size_t>(stride) * static_cast<std::size_t>(h);
-    if (dims_changed) {
-      width_ = w;
-      height_ = h;
-      prev_bgra_.resize(frame_bytes);
-      curr_bgra_.resize(frame_bytes);
-      row_crcs_.resize(static_cast<std::size_t>(h));
-    }
-
     const int tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
     const int tiles_y = (h + TILE_SIZE - 1) / TILE_SIZE;
     const std::size_t total_tiles = static_cast<std::size_t>(tiles_x) * static_cast<std::size_t>(tiles_y);
+
+    if (is_keyframe && (parsed.header.copy_rect_count != 0 || parsed.header.dirty_tile_count != total_tiles)) {
+      return false;
+    }
 
     dirty_refs_.clear();
     dirty_refs_.reserve(parsed.header.dirty_tile_count);
@@ -1460,6 +1455,9 @@ namespace sds::lossless {
           mode_raw > static_cast<std::uint8_t>(tile_mode_e::raw_rgb24)) {
         return false;
       }
+      if (is_keyframe && mode_raw == static_cast<std::uint8_t>(tile_mode_e::ycocgr_temporal_rice)) {
+        return false;
+      }
       dirty_refs_.push_back(dirty_ref_t {
         static_cast<std::uint16_t>(idx % static_cast<std::size_t>(tiles_x)),
         static_cast<std::uint16_t>(idx / static_cast<std::size_t>(tiles_x)),
@@ -1472,6 +1470,15 @@ namespace sds::lossless {
 
     if (offset != parsed.tiles_data_bytes) {
       return false;
+    }
+
+    const std::size_t frame_bytes = static_cast<std::size_t>(stride) * static_cast<std::size_t>(h);
+    if (dims_changed) {
+      width_ = w;
+      height_ = h;
+      prev_bgra_.resize(frame_bytes);
+      curr_bgra_.resize(frame_bytes);
+      row_crcs_.resize(static_cast<std::size_t>(h));
     }
 
     if (!is_keyframe) {
@@ -1520,6 +1527,7 @@ namespace sds::lossless {
     stats.dirty_tiles = parsed.header.dirty_tile_count;
     stats.copy_rects = parsed.header.copy_rect_count;
     if (verify_hash && parsed.header.hash_algo != hash_algo_e::none) {
+      const auto hash_t0 = std::chrono::steady_clock::now();
       stats.hash_verified = true;
       if (parsed.header.hash_algo == hash_algo_e::crc32c) {
         std::function<void(int, int)> hash_job = [&](int y_begin, int y_end) {
@@ -1539,6 +1547,9 @@ namespace sds::lossless {
         stats.computed_hash = blake3_rgb24_from_bgra(curr_bgra_.data(), stride, w, h);
       }
       stats.hash_matched = (stats.computed_hash == parsed.header.frame_hash);
+      const auto hash_t1 = std::chrono::steady_clock::now();
+      stats.hash_us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(hash_t1 - hash_t0).count());
     }
 
     has_prev_ = true;

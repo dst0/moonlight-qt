@@ -182,9 +182,11 @@ kernel void cs_decode_tiles(
     device const DirtyTileDesc* tiles [[buffer(1)]],
     device uchar* curr_bgra [[buffer(2)]],
     constant DecodeParams& params [[buffer(3)]],
-    uint tgid [[threadgroup_position_in_grid]],
+    device atomic_uint* err_flag [[buffer(4)]],
+    uint2 tgid2 [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]])
 {
+    uint tgid = tgid2.y * 256u + tgid2.x;
     if (tgid >= params.dirty_tile_count) return;
     DirtyTileDesc d = tiles[tgid];
     uint pixels = d.tile_w * d.tile_h;
@@ -192,7 +194,10 @@ kernel void cs_decode_tiles(
 
     if (d.mode == 1u) {
         // SOLID
-        if (d.payload_len != 3u) return;
+        if (d.payload_len != 3u) {
+            if (lid == 0u) atomic_store_explicit(err_flag, 1u, memory_order_relaxed);
+            return;
+        }
         uchar r = payload[0], g = payload[1], b = payload[2];
         for (uint i = lid; i < pixels; i += 32u) {
             uint x = i % d.tile_w;
@@ -205,7 +210,10 @@ kernel void cs_decode_tiles(
 
     if (d.mode == 5u) {
         // RAW_RGB24
-        if (d.payload_len != pixels * 3u) return;
+        if (d.payload_len != pixels * 3u) {
+            if (lid == 0u) atomic_store_explicit(err_flag, 1u, memory_order_relaxed);
+            return;
+        }
         for (uint i = lid; i < pixels; i += 32u) {
             uint x = i % d.tile_w;
             uint y = i / d.tile_w;
@@ -220,12 +228,21 @@ kernel void cs_decode_tiles(
 
     if (d.mode == 2u) {
         // PALETTE
-        if (d.payload_len < 1u) return;
+        if (d.payload_len < 1u) {
+            if (lid == 0u) atomic_store_explicit(err_flag, 1u, memory_order_relaxed);
+            return;
+        }
         uint count = uint(payload[0]);
-        if (count < 2u || count > 16u) return;
+        if (count < 2u || count > 16u) {
+            if (lid == 0u) atomic_store_explicit(err_flag, 1u, memory_order_relaxed);
+            return;
+        }
         int bpp = (count <= 2u) ? 1 : (count <= 4u ? 2 : 4);
         uint pal_end = 1u + count * 3u;
-        if (d.payload_len < pal_end) return;
+        if (d.payload_len < pal_end) {
+            if (lid == 0u) atomic_store_explicit(err_flag, 1u, memory_order_relaxed);
+            return;
+        }
         for (uint i = lid; i < pixels; i += 32u) {
             uint bit_idx = i * uint(bpp);
             uint byte_idx = pal_end + (bit_idx >> 3);
@@ -244,7 +261,10 @@ kernel void cs_decode_tiles(
         return;
     }
 
-    if (d.mode != 3u && d.mode != 4u) return;
+    if (d.mode != 3u && d.mode != 4u) {
+        if (lid == 0u) atomic_store_explicit(err_flag, 1u, memory_order_relaxed);
+        return;
+    }
 
     threadgroup ushort tg_sy[1024];
     threadgroup ushort tg_sco[1024];
@@ -266,6 +286,9 @@ kernel void cs_decode_tiles(
                 bool ok3 = ok2 && decode_rice_chan(payload + 6u + sy_len + sco_len, scg_len, d.tile_w, d.tile_h, 10, tg_scg);
                 tg_ok = ok3;
             }
+        }
+        if (!tg_ok) {
+            atomic_store_explicit(err_flag, 1u, memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

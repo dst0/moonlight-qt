@@ -44,6 +44,8 @@ private:
 
     SDL_Thread* m_DecodeThread = nullptr;
     std::atomic_bool m_Stopping {false};
+    std::atomic_bool m_RenderPending {false};
+    std::atomic_bool m_RuntimeUseGpu {false};
     bool m_OverlayRegistered = false;
 
     std::atomic<std::uint64_t> m_ReceivedFrames {0};
@@ -54,12 +56,14 @@ private:
     std::atomic<std::uint64_t> m_TotalBytes {0};
     std::atomic<std::uint64_t> m_LastDecodeUs {0};
     std::atomic<std::uint64_t> m_LastHashUs {0};
+    std::atomic<std::uint64_t> m_LastOverlayMsAtomic {0};
     std::atomic<int> m_StreamWidth {0};
     std::atomic<int> m_StreamHeight {0};
     std::atomic_bool m_LastHostGpu {false};
 
     std::uint64_t m_LastOverlayMs = 0;
     std::uint64_t m_LastOverlayBytes = 0;
+    std::uint64_t m_LastOverlayReceived = 0;
     std::uint64_t m_LastOverlayDecoded = 0;
     std::uint64_t m_LastOverlayRendered = 0;
 };

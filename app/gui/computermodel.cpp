@@ -239,6 +239,7 @@ QVariantMap ComputerModel::getPcSettings(int computerIndex) const
     bool supportsHostEncoder = false;
     bool supportsLosslessVideo = false;
     bool hasHostCaptureAdapter = false;
+    QStringList sdsLosslessBackends;
     {
         QReadLocker lock(&computer->lock);
         paired = (computer->pairState == NvComputer::PS_PAIRED);
@@ -252,6 +253,7 @@ QVariantMap ComputerModel::getPcSettings(int computerIndex) const
                               computer->hasSdsFeature(QStringLiteral("host_encoder"));
         supportsLosslessVideo = paired && !computer->isNvidiaServerSoftware &&
                                 computer->hasSdsFeature(QStringLiteral("lossless_video"));
+        sdsLosslessBackends = computer->sdsLosslessBackends;
         hasHostCaptureAdapter = paired && !computer->isNvidiaServerSoftware &&
                                 computer->hasSdsFeature(QStringLiteral("host_capture_adapter"));
         for (const NvHostAdapter& adapter : computer->sdsAdapters) {
@@ -275,7 +277,7 @@ QVariantMap ComputerModel::getPcSettings(int computerIndex) const
     result.insert(QStringLiteral("supportsAdaptiveTileRefinement"), supportsAdaptive);
     result.insert(QStringLiteral("adaptiveTileRefinement"), prefs->adaptiveRefinementForHost(fp));
     result.insert(QStringLiteral("supportsLosslessVideo"), supportsLosslessVideo);
-    result.insert(QStringLiteral("losslessBackends"), computer->sdsLosslessBackends);
+    result.insert(QStringLiteral("losslessBackends"), sdsLosslessBackends);
     result.insert(QStringLiteral("losslessModeOverride"), prefs->losslessModeOverrideState(fp));
     result.insert(QStringLiteral("supportsHostEncoder"), supportsHostEncoder);
     result.insert(QStringLiteral("hostEncoderConfig"), static_cast<int>(prefs->hostEncoderForHost(fp)));

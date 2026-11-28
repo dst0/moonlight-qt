@@ -7,9 +7,6 @@
 
 #include <QElapsedTimer>
 #include <QFile>
-#include <QProcess>
-#include <QStandardPaths>
-#include <QTemporaryDir>
 
 #include <dlfcn.h>
 
@@ -58,6 +55,7 @@ struct LosslessVulkanRenderer::Impl
     PFN_vkCreateInstance pvkCreateInstance = nullptr;
     PFN_vkDestroyInstance pvkDestroyInstance = nullptr;
     PFN_vkEnumeratePhysicalDevices pvkEnumeratePhysicalDevices = nullptr;
+    PFN_vkGetPhysicalDeviceProperties pvkGetPhysicalDeviceProperties = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties pvkGetPhysicalDeviceQueueFamilyProperties = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties pvkGetPhysicalDeviceMemoryProperties = nullptr;
     PFN_vkCreateDevice pvkCreateDevice = nullptr;
@@ -128,50 +126,23 @@ struct LosslessVulkanRenderer::Impl
         if (lib) dlclose(lib);
     }
 
-    bool compileSpirv(std::vector<std::uint32_t>& outSpv)
+    bool loadSpirv(std::vector<std::uint32_t>& outSpv)
     {
-        QByteArray compSrc = Path::readDataFile("sds_lossless_decode.comp");
-        if (compSrc.isEmpty()) {
-            QFile rf(QStringLiteral(":/data/sds_lossless_decode.comp"));
-            if (rf.open(QIODevice::ReadOnly)) compSrc = rf.readAll();
+        QByteArray bytes = Path::readDataFile("sds_lossless_decode.spv");
+        if (bytes.isEmpty()) {
+            QFile rf(QStringLiteral(":/data/sds_lossless_decode.spv"));
+            if (rf.open(QIODevice::ReadOnly)) bytes = rf.readAll();
         }
-        if (compSrc.isEmpty()) return false;
-
-        QString compiler = QStandardPaths::findExecutable(QStringLiteral("glslc"));
-        bool useGlslang = false;
-        if (compiler.isEmpty()) {
-            compiler = QStandardPaths::findExecutable(QStringLiteral("glslangValidator"));
-            useGlslang = true;
-        }
-        if (compiler.isEmpty()) return false;
-
-        QTemporaryDir dir;
-        if (!dir.isValid()) return false;
-        const QString inPath = dir.filePath(QStringLiteral("decode.comp"));
-        const QString outPath = dir.filePath(QStringLiteral("decode.spv"));
-        QFile inf(inPath);
-        if (!inf.open(QIODevice::WriteOnly)) return false;
-        inf.write(compSrc);
-        inf.close();
-
-        QStringList args = useGlslang
-            ? QStringList { QStringLiteral("-V"), QStringLiteral("-o"), outPath, inPath }
-            : QStringList { QStringLiteral("-O"), inPath, QStringLiteral("-o"), outPath };
-        if (QProcess::execute(compiler, args) != 0) return false;
-
-        QFile spvf(outPath);
-        if (!spvf.open(QIODevice::ReadOnly)) return false;
-        const QByteArray bytes = spvf.readAll();
         if (bytes.size() < 20 || (bytes.size() % 4) != 0) return false;
         outSpv.resize(static_cast<std::size_t>(bytes.size()) / 4u);
         std::memcpy(outSpv.data(), bytes.constData(), static_cast<std::size_t>(bytes.size()));
-        return true;
+        return outSpv[0] == 0x07230203u;
     }
 
     bool init()
     {
         std::vector<std::uint32_t> spv;
-        if (!compileSpirv(spv)) return false;
+        if (!loadSpirv(spv)) return false;
 
         lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
         if (!lib) lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
@@ -188,6 +159,7 @@ struct LosslessVulkanRenderer::Impl
         auto loadI = [&](const char* n) { return getInstProc(instance, n); };
         pvkDestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(loadI("vkDestroyInstance"));
         pvkEnumeratePhysicalDevices = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(loadI("vkEnumeratePhysicalDevices"));
+        pvkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(loadI("vkGetPhysicalDeviceProperties"));
         pvkGetPhysicalDeviceQueueFamilyProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(loadI("vkGetPhysicalDeviceQueueFamilyProperties"));
         pvkGetPhysicalDeviceMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(loadI("vkGetPhysicalDeviceMemoryProperties"));
         pvkCreateDevice = reinterpret_cast<PFN_vkCreateDevice>(loadI("vkCreateDevice"));
@@ -231,22 +203,55 @@ struct LosslessVulkanRenderer::Impl
         pvkUnmapMemory = reinterpret_cast<PFN_vkUnmapMemory>(loadI("vkUnmapMemory"));
         pvkDeviceWaitIdle = reinterpret_cast<PFN_vkDeviceWaitIdle>(loadI("vkDeviceWaitIdle"));
 
+        if (!pvkDestroyInstance || !pvkEnumeratePhysicalDevices || !pvkGetPhysicalDeviceProperties ||
+            !pvkGetPhysicalDeviceQueueFamilyProperties || !pvkGetPhysicalDeviceMemoryProperties ||
+            !pvkCreateDevice || !pvkDestroyDevice || !pvkGetDeviceQueue ||
+            !pvkCreateDescriptorSetLayout || !pvkDestroyDescriptorSetLayout ||
+            !pvkCreatePipelineLayout || !pvkDestroyPipelineLayout ||
+            !pvkCreateShaderModule || !pvkDestroyShaderModule ||
+            !pvkCreateComputePipelines || !pvkDestroyPipeline ||
+            !pvkCreateDescriptorPool || !pvkDestroyDescriptorPool ||
+            !pvkAllocateDescriptorSets || !pvkUpdateDescriptorSets ||
+            !pvkCreateCommandPool || !pvkDestroyCommandPool ||
+            !pvkAllocateCommandBuffers || !pvkResetCommandBuffer ||
+            !pvkBeginCommandBuffer || !pvkEndCommandBuffer ||
+            !pvkCmdBindPipeline || !pvkCmdBindDescriptorSets ||
+            !pvkCmdPushConstants || !pvkCmdDispatch || !pvkCmdPipelineBarrier ||
+            !pvkCreateFence || !pvkDestroyFence || !pvkResetFences || !pvkWaitForFences ||
+            !pvkQueueSubmit || !pvkCreateBuffer || !pvkDestroyBuffer ||
+            !pvkGetBufferMemoryRequirements || !pvkAllocateMemory || !pvkFreeMemory ||
+            !pvkBindBufferMemory || !pvkMapMemory || !pvkUnmapMemory || !pvkDeviceWaitIdle) {
+            return false;
+        }
+
         std::uint32_t cnt = 0;
         pvkEnumeratePhysicalDevices(instance, &cnt, nullptr);
         if (cnt == 0) return false;
         std::vector<VkPhysicalDevice> pds(cnt);
         pvkEnumeratePhysicalDevices(instance, &cnt, pds.data());
+        int bestScore = -1;
         for (auto pd : pds) {
+            VkPhysicalDeviceProperties props {};
+            pvkGetPhysicalDeviceProperties(pd, &props);
+            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+                continue;
+            }
             std::uint32_t qc = 0;
             pvkGetPhysicalDeviceQueueFamilyProperties(pd, &qc, nullptr);
             std::vector<VkQueueFamilyProperties> qps(qc);
             pvkGetPhysicalDeviceQueueFamilyProperties(pd, &qc, qps.data());
             for (std::uint32_t qi = 0; qi < qc; ++qi) {
                 if (qps[qi].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-                    phys = pd; queueFamily = qi; break;
+                    const int score = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) ? 3
+                                    : (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 2 : 1;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        phys = pd;
+                        queueFamily = qi;
+                    }
+                    break;
                 }
             }
-            if (phys) break;
         }
         if (!phys) return false;
         pvkGetPhysicalDeviceMemoryProperties(phys, &memProps);
@@ -309,15 +314,26 @@ struct LosslessVulkanRenderer::Impl
         VkMemoryRequirements mr {};
         pvkGetBufferMemoryRequirements(device, out.buf, &mr);
         std::uint32_t mid = UINT32_MAX;
-        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const VkMemoryPropertyFlags cachedWant =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        const VkMemoryPropertyFlags fallbackWant =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         for (std::uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-            if ((mr.memoryTypeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & want) == want) { mid = i; break; }
+            if ((mr.memoryTypeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & cachedWant) == cachedWant) { mid = i; break; }
+        }
+        if (mid == UINT32_MAX) {
+            for (std::uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if ((mr.memoryTypeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & fallbackWant) == fallbackWant) { mid = i; break; }
+            }
         }
         if (mid == UINT32_MAX) { destroyBuf(out); return false; }
         VkMemoryAllocateInfo ai { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, mr.size, mid };
         if (pvkAllocateMemory(device, &ai, nullptr, &out.mem) != VK_SUCCESS) { destroyBuf(out); return false; }
-        pvkBindBufferMemory(device, out.buf, out.mem, 0);
-        pvkMapMemory(device, out.mem, 0, sz, 0, &out.mapped);
+        if (pvkBindBufferMemory(device, out.buf, out.mem, 0) != VK_SUCCESS ||
+            pvkMapMemory(device, out.mem, 0, sz, 0, &out.mapped) != VK_SUCCESS) {
+            destroyBuf(out);
+            return false;
+        }
         out.size = sz;
         return out.mapped != nullptr;
     }
@@ -352,8 +368,18 @@ struct LosslessVulkanRenderer::Impl
         const int w = hdr.width, h = hdr.height;
         if (!isKey && (!hasPrev || w != curW || h != curH)) return false;
 
+        const int tilesX = (w + sds::lossless::TILE_SIZE - 1) / sds::lossless::TILE_SIZE;
+        const int tilesY = (h + sds::lossless::TILE_SIZE - 1) / sds::lossless::TILE_SIZE;
+        const std::size_t totalTiles = static_cast<std::size_t>(tilesX) * static_cast<std::size_t>(tilesY);
+        if (isKey && (parsed.header.copy_rect_count != 0 || parsed.header.dirty_tile_count != totalTiles)) return false;
+
         std::vector<sds::lossless::gpu_tile_desc_t> descs;
         if (!sds::lossless::build_dirty_tile_descs(parsed, packet, descs)) return false;
+        if (isKey) {
+            for (const auto& d : descs) {
+                if (d.mode == static_cast<std::uint32_t>(sds::lossless::tile_mode_e::ycocgr_temporal_rice)) return false;
+            }
+        }
 
         const std::size_t frameBytes = static_cast<std::size_t>(w) * h * 4u;
         const std::size_t pktAlign = (len + 15u) & ~std::size_t(15u);
@@ -397,7 +423,9 @@ struct LosslessVulkanRenderer::Impl
         if (!descs.empty()) {
             pc.stage = 1;
             pvkCmdPushConstants(cmdBuf, plLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            pvkCmdDispatch(cmdBuf, static_cast<std::uint32_t>(descs.size()), 1, 1);
+            const std::uint32_t gx = static_cast<std::uint32_t>(std::min<std::size_t>(descs.size(), 256u));
+            const std::uint32_t gy = static_cast<std::uint32_t>((descs.size() + 255u) / 256u);
+            pvkCmdDispatch(cmdBuf, gx, gy, 1);
             VkMemoryBarrier bar { VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT };
             pvkCmdPipelineBarrier(cmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &bar, 0, nullptr, 0, nullptr);
         }

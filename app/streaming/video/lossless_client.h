@@ -46,6 +46,7 @@ public:
     SdsLosslessClient& operator=(const SdsLosslessClient&) = delete;
 
     void start();
+    void wakeWaiters();
     void stop();
 
     void requestKeyframe();

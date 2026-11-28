@@ -165,7 +165,7 @@ void main() {
         return;
     }
 
-    uint tidx = gl_WorkGroupID.x;
+    uint tidx = gl_WorkGroupID.y * 256u + gl_WorkGroupID.x;
     if (tidx >= pc.dirty_tile_count) return;
     uvec4 d0 = descs[tidx * 2u];
     uvec4 d1 = descs[tidx * 2u + 1u];
@@ -225,6 +225,7 @@ void main() {
             }
         }
     }
+    memoryBarrierShared();
     barrier();
     if (gs_ok == 0u) return;
 
@@ -245,6 +246,7 @@ void main() {
                 }
             }
         }
+        memoryBarrierShared();
         barrier();
         for (uint i = lid; i < pixels; i += 32u) {
             uint r, g, b;

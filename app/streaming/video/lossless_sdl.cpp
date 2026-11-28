@@ -113,7 +113,7 @@ bool LosslessSdlRenderer::presentPacket(const std::uint8_t* packet,
 
     const std::uint64_t totalUs = static_cast<std::uint64_t>(timer.nsecsElapsed() / 1000);
     outDecodeUs = totalUs;
-    outHashUs = 0;
+    outHashUs = stats.hash_us;
     outHashOk = (!verifyHash || hdr.hash_algo == sds::lossless::hash_algo_e::none) ? true : stats.hash_matched;
 
     const int w = m_Decoder.width();
@@ -246,14 +246,13 @@ void LosslessSdlRenderer::renderOnMainThread()
     if (m_Texture && m_HasPresented) {
         const int vw = (w > 0) ? w : m_TexWidth;
         const int vh = (h > 0) ? h : m_TexHeight;
-        SDL_SetTextureScaleMode(m_Texture,
-                                (outW == vw && outH == vh) ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
-
         SDL_Rect src {0, 0, vw, vh};
         SDL_Rect dst {0, 0, outW, outH};
         if (vw > 0 && vh > 0 && outW > 0 && outH > 0) {
             StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
         }
+        SDL_SetTextureScaleMode(m_Texture,
+                                (dst.w == vw && dst.h == vh) ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
         SDL_RenderCopy(m_Renderer, m_Texture, nullptr, &dst);
     }
 
@@ -264,7 +263,12 @@ void LosslessSdlRenderer::renderOnMainThread()
             updateOverlayTexture(type);
         }
         if (m_OverlayManager && m_OverlayManager->isOverlayEnabled(type) && m_OverlayTextures[i]) {
-            SDL_RenderCopy(m_Renderer, m_OverlayTextures[i], nullptr, &m_OverlayRects[i]);
+            const int ow = m_OverlayRects[i].w;
+            const int oh = m_OverlayRects[i].h;
+            SDL_Rect r = (type == Overlay::OverlayStatusUpdate)
+                ? SDL_Rect { outW - ow - 10, outH - oh - 10, ow, oh }
+                : SDL_Rect { 10, 10, ow, oh };
+            SDL_RenderCopy(m_Renderer, m_OverlayTextures[i], nullptr, &r);
         }
     }
 

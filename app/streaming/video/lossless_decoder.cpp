@@ -47,11 +47,14 @@ LosslessVideoDecoder::~LosslessVideoDecoder()
 {
     m_Stopping.store(true, std::memory_order_release);
     if (m_Client) {
-        m_Client->stop();
+        m_Client->wakeWaiters();
     }
     if (m_DecodeThread) {
         SDL_WaitThread(m_DecodeThread, nullptr);
         m_DecodeThread = nullptr;
+    }
+    if (m_Client) {
+        m_Client->stop();
     }
     if (m_OverlayRegistered) {
         if (Session* s = Session::get()) {
@@ -137,6 +140,10 @@ bool LosslessVideoDecoder::initialize(PDECODER_PARAMETERS params)
     m_Client = std::make_unique<SdsLosslessClient>(cfg);
     m_Client->start();
 
+    m_RuntimeUseGpu.store(preferGpu && m_Renderer->supportsGpuCompute(), std::memory_order_release);
+    m_LastOverlayMs = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
+    m_LastOverlayMsAtomic.store(m_LastOverlayMs, std::memory_order_release);
+
     m_Stopping.store(false, std::memory_order_release);
     m_DecodeThread = SDL_CreateThread(LosslessVideoDecoder::decodeThreadProc, "LosslessDecode", this);
     if (!m_DecodeThread) {
@@ -196,6 +203,7 @@ int LosslessVideoDecoder::submitDecodeUnit(PDECODE_UNIT)
 
 void LosslessVideoDecoder::renderFrameOnMainThread()
 {
+    m_RenderPending.store(false, std::memory_order_release);
     if (!m_Renderer) {
         return;
     }
@@ -232,12 +240,48 @@ int LosslessVideoDecoder::decodeThreadProc(void* context)
 
 void LosslessVideoDecoder::runDecodeLoop()
 {
-    const bool useGpuCompute = (m_Params.losslessDecoderMode != StreamingPreferences::LDM_CPU);
     const bool verifyHash = (m_Params.losslessHashMode != StreamingPreferences::LHM_OFF);
 
+    auto pushRenderEvent = [this]() {
+        if (!m_RenderPending.exchange(true, std::memory_order_acq_rel)) {
+            SDL_Event event {};
+            event.type = SDL_USEREVENT;
+            event.user.code = SDL_CODE_FRAME_READY;
+            SDL_PushEvent(&event);
+        }
+    };
+
     while (!m_Stopping.load(std::memory_order_acquire)) {
+        if (m_Client && m_Client->hadPinFailure()) {
+            const QString err = m_Client->lastError();
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "LosslessVideoDecoder: TLS certificate pinning/auth error: %s",
+                         qUtf8Printable(err));
+            if (Session* s = Session::get()) {
+                s->terminateWithError(QObject::tr("Lossless video connection terminated: %1").arg(err));
+            }
+            break;
+        }
+
         SdsLosslessClient::FramePacket pkt;
         if (!m_Client || !m_Client->popFrame(pkt, 25)) {
+            if (m_Client && m_Client->hadPinFailure()) {
+                const QString err = m_Client->lastError();
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "LosslessVideoDecoder: TLS certificate pinning/auth error: %s",
+                             qUtf8Printable(err));
+                if (Session* s = Session::get()) {
+                    s->terminateWithError(QObject::tr("Lossless video connection terminated: %1").arg(err));
+                }
+                break;
+            }
+            if (Session* s = Session::get();
+                s && s->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug)) {
+                const std::uint64_t nowMs = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
+                if (nowMs - m_LastOverlayMsAtomic.load(std::memory_order_acquire) >= 500) {
+                    pushRenderEvent();
+                }
+            }
             continue;
         }
         if (m_Stopping.load(std::memory_order_acquire)) {
@@ -253,15 +297,34 @@ void LosslessVideoDecoder::runDecodeLoop()
         bool hashOk = true;
         std::uint64_t decodeUs = 0;
         std::uint64_t hashUs = 0;
-        const bool ok = m_Renderer->presentPacket(
+        const bool tryGpu = m_RuntimeUseGpu.load(std::memory_order_acquire);
+        bool ok = m_Renderer->presentPacket(
             reinterpret_cast<const std::uint8_t*>(pkt.bytes.constData()),
             static_cast<std::size_t>(pkt.bytes.size()),
             pkt.header,
-            useGpuCompute,
+            tryGpu,
             verifyHash,
             hashOk,
             decodeUs,
             hashUs);
+
+        if (!ok && tryGpu && m_Params.losslessDecoderMode == StreamingPreferences::LDM_AUTO) {
+            ok = m_Renderer->presentPacket(
+                reinterpret_cast<const std::uint8_t*>(pkt.bytes.constData()),
+                static_cast<std::size_t>(pkt.bytes.size()),
+                pkt.header,
+                false,
+                verifyHash,
+                hashOk,
+                decodeUs,
+                hashUs);
+            if (ok) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "LosslessVideoDecoder: GPU decode failed on frame #%llu; falling back to CPU-SIMD under LDM_AUTO",
+                            static_cast<unsigned long long>(pkt.header.frame_id));
+                m_RuntimeUseGpu.store(false, std::memory_order_release);
+            }
+        }
 
         if (!ok) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -292,10 +355,7 @@ void LosslessVideoDecoder::runDecodeLoop()
             }
         }
 
-        SDL_Event event {};
-        event.type = SDL_USEREVENT;
-        event.user.code = SDL_CODE_FRAME_READY;
-        SDL_PushEvent(&event);
+        pushRenderEvent();
     }
 }
 
@@ -308,6 +368,7 @@ void LosslessVideoDecoder::updateDebugOverlayIfDue()
     const std::uint64_t nowMs = static_cast<std::uint64_t>(QDateTime::currentMSecsSinceEpoch());
     if (m_LastOverlayMs == 0) {
         m_LastOverlayMs = nowMs;
+        m_LastOverlayMsAtomic.store(nowMs, std::memory_order_release);
         return;
     }
     const std::uint64_t elapsedMs = nowMs - m_LastOverlayMs;
@@ -316,16 +377,20 @@ void LosslessVideoDecoder::updateDebugOverlayIfDue()
     }
 
     const std::uint64_t curBytes = m_TotalBytes.load(std::memory_order_relaxed);
+    const std::uint64_t curRecv = m_ReceivedFrames.load(std::memory_order_relaxed);
     const std::uint64_t curDec = m_DecodedFrames.load(std::memory_order_relaxed);
     const std::uint64_t curRen = m_RenderedFrames.load(std::memory_order_relaxed);
 
     const double secs = static_cast<double>(elapsedMs) / 1000.0;
     const double mbps = (static_cast<double>(curBytes - m_LastOverlayBytes) * 8.0) / (secs * 1000000.0);
+    const double recvFps = static_cast<double>(curRecv - m_LastOverlayReceived) / secs;
     const double decFps = static_cast<double>(curDec - m_LastOverlayDecoded) / secs;
     const double renFps = static_cast<double>(curRen - m_LastOverlayRendered) / secs;
 
     m_LastOverlayMs = nowMs;
+    m_LastOverlayMsAtomic.store(nowMs, std::memory_order_release);
     m_LastOverlayBytes = curBytes;
+    m_LastOverlayReceived = curRecv;
     m_LastOverlayDecoded = curDec;
     m_LastOverlayRendered = curRen;
 
@@ -338,13 +403,14 @@ void LosslessVideoDecoder::updateDebugOverlayIfDue()
     std::snprintf(buf, sizeof(buf),
                   "Stream: %dx%d | SDLL v1 Bit-Exact Lossless RGB24\n"
                   "Host: %s | Client: %s\n"
-                  "Incoming/Render FPS: %.1f / %.1f | Bitrate: %.2f Mbps\n"
+                  "Incoming/Decode/Render FPS: %.1f / %.1f / %.1f | Bitrate: %.2f Mbps\n"
                   "Hash (%s): %s (mismatches: %llu)\n"
                   "Decode / Hash time: %.2f ms / %.2f ms",
                   m_StreamWidth.load(std::memory_order_relaxed),
                   m_StreamHeight.load(std::memory_order_relaxed),
                   m_LastHostGpu.load(std::memory_order_relaxed) ? "GPU-Compute" : "CPU-SIMD",
                   m_Renderer ? m_Renderer->backendName() : "none",
+                  recvFps,
                   decFps,
                   renFps,
                   mbps,

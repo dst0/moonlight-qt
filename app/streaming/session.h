@@ -134,6 +134,8 @@ public:
 
     void setShouldExit(bool quitHostApp = false);
 
+    void terminateWithError(const QString& message);
+
 signals:
     void stageStarting(QString stage);
 

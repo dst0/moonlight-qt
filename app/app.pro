@@ -309,7 +309,7 @@ macx {
 } else:win32:!winrt {
     SOURCES += streaming/video/lossless_d3d11.cpp
     HEADERS += streaming/video/lossless_d3d11.h
-} else:unix:!macx:!android {
+} else:linux:!android {
     SOURCES += streaming/video/lossless_vulkan.cpp
     HEADERS += streaming/video/lossless_vulkan.h
     LIBS += -ldl

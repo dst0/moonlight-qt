@@ -6,6 +6,7 @@
 #include "streaming/streamutils.h"
 
 #import <Cocoa/Cocoa.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
@@ -101,9 +102,10 @@ struct LosslessMetalRenderer::Impl
     id<MTLBuffer> rowCrcsBuf = nil;
     id<MTLBuffer> crcTableBuf = nil;
     id<MTLBuffer> paramsBuf = nil;
+    id<MTLBuffer> errFlagBuf = nil;
     id<MTLBuffer> quadVertsBuf = nil;
 
-    id<MTLTexture> videoTex = nil;
+    id<MTLTexture> videoTex[2] {};
     id<MTLTexture> overlayTex[Overlay::OverlayMax] {};
     SDL_Rect overlayRect[Overlay::OverlayMax] {};
 
@@ -111,8 +113,9 @@ struct LosslessMetalRenderer::Impl
     std::size_t capPacketBytes = 0;
     std::size_t capTileDescBytes = 0;
     std::size_t capRowCrcBytes = 0;
-    int texWidth = 0;
-    int texHeight = 0;
+    int texWidth[2] {};
+    int texHeight[2] {};
+    int renderTexIdx = 0;
     int curWidth = 0;
     int curHeight = 0;
     bool hasPrev = false;
@@ -124,7 +127,10 @@ struct LosslessMetalRenderer::Impl
             [overlayTex[i] release];
             overlayTex[i] = nil;
         }
-        [videoTex release];
+        for (int i = 0; i < 2; ++i) {
+            [videoTex[i] release];
+            videoTex[i] = nil;
+        }
         [prevBgra release];
         [currBgra release];
         [packetBuf release];
@@ -132,6 +138,7 @@ struct LosslessMetalRenderer::Impl
         [rowCrcsBuf release];
         [crcTableBuf release];
         [paramsBuf release];
+        [errFlagBuf release];
         [quadVertsBuf release];
         [psoOverlay release];
         [psoVideoLinear release];
@@ -205,7 +212,9 @@ struct LosslessMetalRenderer::Impl
                                              options:MTLResourceStorageModeShared];
             paramsBuf = [device newBufferWithLength:sizeof(MetalDecodeParams)
                                             options:MTLResourceStorageModeShared];
-            if (!crcTableBuf || !paramsBuf) {
+            errFlagBuf = [device newBufferWithLength:sizeof(std::uint32_t)
+                                             options:MTLResourceStorageModeShared];
+            if (!crcTableBuf || !paramsBuf || !errFlagBuf) {
                 return false;
             }
 
@@ -223,6 +232,10 @@ struct LosslessMetalRenderer::Impl
             metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
             metalLayer.framebufferOnly = YES;
             metalLayer.displaySyncEnabled = enableVsync;
+            if (CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB)) {
+                metalLayer.colorspace = srgb;
+                CGColorSpaceRelease(srgb);
+            }
 
             auto makeRender = [&](NSString* fragName, bool blend) -> id<MTLRenderPipelineState> {
                 id<MTLFunction> vfn = [library newFunctionWithName:@"vs_quad"];
@@ -261,7 +274,7 @@ struct LosslessMetalRenderer::Impl
         }
     }
 
-    bool ensureBuffers(int width, int height, std::size_t packetBytes, std::size_t dirtyTileCount, bool createTex)
+    bool ensureBuffers(int width, int height, std::size_t packetBytes, std::size_t dirtyTileCount, bool createTex, int texIdx)
     {
         const std::size_t frameBytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
         if (frameBytes > capFrameBytes) {
@@ -271,6 +284,7 @@ struct LosslessMetalRenderer::Impl
             currBgra = [device newBufferWithLength:frameBytes options:MTLResourceStorageModeShared];
             if (!prevBgra || !currBgra) {
                 capFrameBytes = 0;
+                hasPrev = false;
                 return false;
             }
             capFrameBytes = frameBytes;
@@ -304,20 +318,22 @@ struct LosslessMetalRenderer::Impl
             }
             capRowCrcBytes = rowBytes;
         }
-        if (createTex && (texWidth != width || texHeight != height || !videoTex)) {
-            [videoTex release];
+        if (createTex && (texWidth[texIdx] != width || texHeight[texIdx] != height || !videoTex[texIdx])) {
+            [videoTex[texIdx] release];
             MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                             width:static_cast<NSUInteger>(width)
                                                                                            height:static_cast<NSUInteger>(height)
                                                                                         mipmapped:NO];
             td.usage = MTLTextureUsageShaderRead;
             td.storageMode = MTLStorageModeManaged;
-            videoTex = [device newTextureWithDescriptor:td];
-            if (!videoTex) {
+            videoTex[texIdx] = [device newTextureWithDescriptor:td];
+            if (!videoTex[texIdx]) {
+                texWidth[texIdx] = 0;
+                texHeight[texIdx] = 0;
                 return false;
             }
-            texWidth = width;
-            texHeight = height;
+            texWidth[texIdx] = width;
+            texHeight[texIdx] = height;
         }
         return true;
     }
@@ -331,57 +347,76 @@ struct LosslessMetalRenderer::Impl
                         std::uint32_t* outCombinedCrc,
                         std::uint64_t& outHashUs)
     {
-        sds::lossless::parsed_frame_t parsed;
-        if (!sds::lossless::parse_frame_packet(packet, len, parsed)) {
-            outHashOk = false;
-            return false;
-        }
-        const bool dimsChanged = (static_cast<int>(hdr.width) != curWidth || static_cast<int>(hdr.height) != curHeight);
-        const bool isKeyframe = (hdr.flags & sds::lossless::FLAG_KEYFRAME) != 0;
-        if (!isKeyframe && (!hasPrev || dimsChanged)) {
-            outHashOk = false;
-            return false;
-        }
-
-        const int w = static_cast<int>(hdr.width);
-        const int h = static_cast<int>(hdr.height);
-        const int stride = w * 4;
-        const std::size_t frameBytes = static_cast<std::size_t>(stride) * static_cast<std::size_t>(h);
-
-        std::vector<sds::lossless::gpu_tile_desc_t> descs;
-        if (!sds::lossless::build_dirty_tile_descs(parsed, packet, descs)) {
-            outHashOk = false;
-            return false;
-        }
-        if (!ensureBuffers(w, h, len, descs.size(), blitTexture)) {
-            outHashOk = false;
-            return false;
-        }
-
-        std::memcpy([packetBuf contents], packet, len);
-        if (!descs.empty()) {
-            std::memcpy([tileDescBuf contents], descs.data(), descs.size() * sizeof(sds::lossless::gpu_tile_desc_t));
-        }
-
-        auto* params = static_cast<MetalDecodeParams*>([paramsBuf contents]);
-        std::memset(params, 0, sizeof(*params));
-        params->width = hdr.width;
-        params->height = hdr.height;
-        params->stride = static_cast<std::uint32_t>(stride);
-        params->copy_rect_count = static_cast<std::uint32_t>(std::min<std::size_t>(parsed.copy_rects.size(), sds::lossless::MAX_COPY_RECTS));
-        params->dirty_tile_count = static_cast<std::uint32_t>(descs.size());
-        for (std::uint32_t i = 0; i < params->copy_rect_count; ++i) {
-            params->copy_rects[i].src_x = parsed.copy_rects[i].src_x;
-            params->copy_rects[i].src_y = parsed.copy_rects[i].src_y;
-            params->copy_rects[i].dst_x = parsed.copy_rects[i].dst_x;
-            params->copy_rects[i].dst_y = parsed.copy_rects[i].dst_y;
-            params->copy_rects[i].w = parsed.copy_rects[i].w;
-            params->copy_rects[i].h = parsed.copy_rects[i].h;
-        }
-
         @autoreleasepool {
+            sds::lossless::parsed_frame_t parsed;
+            if (!sds::lossless::parse_frame_packet(packet, len, parsed)) {
+                outHashOk = false;
+                return false;
+            }
+            const bool dimsChanged = (static_cast<int>(hdr.width) != curWidth || static_cast<int>(hdr.height) != curHeight);
+            const bool isKeyframe = (hdr.flags & sds::lossless::FLAG_KEYFRAME) != 0;
+            if (!isKeyframe && (!hasPrev || dimsChanged)) {
+                outHashOk = false;
+                return false;
+            }
+
+            const int w = static_cast<int>(hdr.width);
+            const int h = static_cast<int>(hdr.height);
+            const int stride = w * 4;
+            const std::size_t frameBytes = static_cast<std::size_t>(stride) * static_cast<std::size_t>(h);
+            const int tilesX = (w + sds::lossless::TILE_SIZE - 1) / sds::lossless::TILE_SIZE;
+            const int tilesY = (h + sds::lossless::TILE_SIZE - 1) / sds::lossless::TILE_SIZE;
+            const std::size_t totalTiles = static_cast<std::size_t>(tilesX) * static_cast<std::size_t>(tilesY);
+            if (isKeyframe && (parsed.header.copy_rect_count != 0 || parsed.header.dirty_tile_count != totalTiles)) {
+                outHashOk = false;
+                return false;
+            }
+
+            std::vector<sds::lossless::gpu_tile_desc_t> descs;
+            if (!sds::lossless::build_dirty_tile_descs(parsed, packet, descs)) {
+                outHashOk = false;
+                return false;
+            }
+            if (isKeyframe) {
+                for (const auto& d : descs) {
+                    if (d.mode == static_cast<std::uint32_t>(sds::lossless::tile_mode_e::ycocgr_temporal_rice)) {
+                        outHashOk = false;
+                        return false;
+                    }
+                }
+            }
+            const int writeIdx = blitTexture ? (1 - renderTexIdx) : 0;
+            if (!ensureBuffers(w, h, len, descs.size(), blitTexture, writeIdx)) {
+                outHashOk = false;
+                hasPrev = false;
+                return false;
+            }
+
+            std::memcpy([packetBuf contents], packet, len);
+            if (!descs.empty()) {
+                std::memcpy([tileDescBuf contents], descs.data(), descs.size() * sizeof(sds::lossless::gpu_tile_desc_t));
+            }
+            *static_cast<std::uint32_t*>([errFlagBuf contents]) = 0u;
+
+            auto* params = static_cast<MetalDecodeParams*>([paramsBuf contents]);
+            std::memset(params, 0, sizeof(*params));
+            params->width = hdr.width;
+            params->height = hdr.height;
+            params->stride = static_cast<std::uint32_t>(stride);
+            params->copy_rect_count = static_cast<std::uint32_t>(std::min<std::size_t>(parsed.copy_rects.size(), sds::lossless::MAX_COPY_RECTS));
+            params->dirty_tile_count = static_cast<std::uint32_t>(descs.size());
+            for (std::uint32_t i = 0; i < params->copy_rect_count; ++i) {
+                params->copy_rects[i].src_x = parsed.copy_rects[i].src_x;
+                params->copy_rects[i].src_y = parsed.copy_rects[i].src_y;
+                params->copy_rects[i].dst_x = parsed.copy_rects[i].dst_x;
+                params->copy_rects[i].dst_y = parsed.copy_rects[i].dst_y;
+                params->copy_rects[i].w = parsed.copy_rects[i].w;
+                params->copy_rects[i].h = parsed.copy_rects[i].h;
+            }
+
             id<MTLCommandBuffer> cmd = [queue commandBuffer];
             if (!cmd) {
+                hasPrev = false;
                 return false;
             }
             id<MTLComputeCommandEncoder> ce = [cmd computeCommandEncoder];
@@ -390,16 +425,19 @@ struct LosslessMetalRenderer::Impl
                 [ce setBuffer:prevBgra offset:0 atIndex:0];
                 [ce setBuffer:currBgra offset:0 atIndex:1];
                 [ce setBuffer:paramsBuf offset:0 atIndex:2];
-                [ce dispatchThreads:MTLSizeMake(hdr.width, hdr.height, 1)
-               threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+                [ce dispatchThreadgroups:MTLSizeMake((hdr.width + 15u) / 16u, (hdr.height + 15u) / 16u, 1)
+                   threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
             }
             if (!descs.empty()) {
+                const NSUInteger gx = std::min<NSUInteger>(descs.size(), 256u);
+                const NSUInteger gy = (descs.size() + 255u) / 256u;
                 [ce setComputePipelineState:psoDecodeTiles];
                 [ce setBuffer:packetBuf offset:0 atIndex:0];
                 [ce setBuffer:tileDescBuf offset:0 atIndex:1];
                 [ce setBuffer:currBgra offset:0 atIndex:2];
                 [ce setBuffer:paramsBuf offset:0 atIndex:3];
-                [ce dispatchThreadgroups:MTLSizeMake(descs.size(), 1, 1)
+                [ce setBuffer:errFlagBuf offset:0 atIndex:4];
+                [ce dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             }
             if (verifyHash && hdr.hash_algo == sds::lossless::hash_algo_e::crc32c) {
@@ -408,19 +446,19 @@ struct LosslessMetalRenderer::Impl
                 [ce setBuffer:rowCrcsBuf offset:0 atIndex:1];
                 [ce setBuffer:crcTableBuf offset:0 atIndex:2];
                 [ce setBuffer:paramsBuf offset:0 atIndex:3];
-                [ce dispatchThreads:MTLSizeMake(hdr.height, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [ce dispatchThreadgroups:MTLSizeMake((hdr.height + 63u) / 64u, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             }
             [ce endEncoding];
 
-            if (blitTexture && videoTex) {
+            if (blitTexture && videoTex[writeIdx]) {
                 id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
                 [blit copyFromBuffer:currBgra
                         sourceOffset:0
                    sourceBytesPerRow:static_cast<NSUInteger>(stride)
                  sourceBytesPerImage:static_cast<NSUInteger>(frameBytes)
                           sourceSize:MTLSizeMake(hdr.width, hdr.height, 1)
-                           toTexture:videoTex
+                           toTexture:videoTex[writeIdx]
                     destinationSlice:0
                     destinationLevel:0
                    destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -429,46 +467,49 @@ struct LosslessMetalRenderer::Impl
 
             [cmd commit];
             [cmd waitUntilCompleted];
-            if ([cmd status] != MTLCommandBufferStatusCompleted) {
+            if ([cmd status] != MTLCommandBufferStatusCompleted ||
+                *static_cast<const std::uint32_t*>([errFlagBuf contents]) != 0u) {
                 outHashOk = false;
+                hasPrev = false;
                 return false;
             }
-        }
 
-        QElapsedTimer htimer;
-        htimer.start();
-        outHashOk = true;
-        if (verifyHash && hdr.hash_algo == sds::lossless::hash_algo_e::crc32c) {
-            const auto* rowCrcs = static_cast<const std::uint32_t*>([rowCrcsBuf contents]);
-            const std::uint64_t rowBytesRgb = static_cast<std::uint64_t>(w) * 3ULL;
-            std::uint32_t combined = rowCrcs[0];
-            for (int y = 1; y < h; ++y) {
-                combined = sds::lossless::crc32c_combine(combined, rowCrcs[y], rowBytesRgb);
+            QElapsedTimer htimer;
+            htimer.start();
+            outHashOk = true;
+            if (verifyHash && hdr.hash_algo == sds::lossless::hash_algo_e::crc32c) {
+                const auto* rowCrcs = static_cast<const std::uint32_t*>([rowCrcsBuf contents]);
+                const std::uint64_t rowBytesRgb = static_cast<std::uint64_t>(w) * 3ULL;
+                std::uint32_t combined = rowCrcs[0];
+                for (int y = 1; y < h; ++y) {
+                    combined = sds::lossless::crc32c_combine(combined, rowCrcs[y], rowBytesRgb);
+                }
+                if (outCombinedCrc) {
+                    *outCombinedCrc = combined;
+                }
+                const std::uint32_t expected =
+                    static_cast<std::uint32_t>(hdr.frame_hash[0]) |
+                    (static_cast<std::uint32_t>(hdr.frame_hash[1]) << 8) |
+                    (static_cast<std::uint32_t>(hdr.frame_hash[2]) << 16) |
+                    (static_cast<std::uint32_t>(hdr.frame_hash[3]) << 24);
+                outHashOk = (combined == expected);
+            } else if (verifyHash && hdr.hash_algo == sds::lossless::hash_algo_e::blake3) {
+                const auto* currPtr = static_cast<const std::uint8_t*>([currBgra contents]);
+                const auto b3 = sds::lossless::blake3_rgb24_from_bgra(currPtr, stride, w, h);
+                outHashOk = (b3 == hdr.frame_hash);
             }
-            if (outCombinedCrc) {
-                *outCombinedCrc = combined;
-            }
-            const std::uint32_t expected =
-                static_cast<std::uint32_t>(hdr.frame_hash[0]) |
-                (static_cast<std::uint32_t>(hdr.frame_hash[1]) << 8) |
-                (static_cast<std::uint32_t>(hdr.frame_hash[2]) << 16) |
-                (static_cast<std::uint32_t>(hdr.frame_hash[3]) << 24);
-            outHashOk = (combined == expected);
-        } else if (verifyHash && hdr.hash_algo == sds::lossless::hash_algo_e::blake3) {
-            const auto* currPtr = static_cast<const std::uint8_t*>([currBgra contents]);
-            const auto b3 = sds::lossless::blake3_rgb24_from_bgra(currPtr, stride, w, h);
-            outHashOk = (b3 == hdr.frame_hash);
-        }
-        outHashUs = static_cast<std::uint64_t>(htimer.nsecsElapsed() / 1000);
+            outHashUs = static_cast<std::uint64_t>(htimer.nsecsElapsed() / 1000);
 
-        curWidth = w;
-        curHeight = h;
-        hasPrev = true;
-        if (blitTexture) {
-            hasRenderTex = true;
+            curWidth = w;
+            curHeight = h;
+            hasPrev = true;
+            if (blitTexture) {
+                renderTexIdx = writeIdx;
+                hasRenderTex = true;
+            }
+            std::swap(prevBgra, currBgra);
+            return true;
         }
-        std::swap(prevBgra, currBgra);
-        return true;
     }
 };
 
@@ -526,10 +567,12 @@ bool LosslessMetalRenderer::presentPacket(const std::uint8_t* packet,
         return ok;
     }
 
-    m_UsingGpuCompute = false;
-    m_Impl->hasPrev = false;
+    lk.unlock();
     sds::lossless::decode_stats_t stats {};
     if (!m_CpuDecoder.decode_frame(packet, len, verifyHash, nullptr, &stats)) {
+        QMutexLocker lk2(&m_FrameMutex);
+        m_UsingGpuCompute = false;
+        m_Impl->hasPrev = false;
         outHashOk = false;
         outDecodeUs = static_cast<std::uint64_t>(timer.nsecsElapsed() / 1000);
         outHashUs = 0;
@@ -537,18 +580,23 @@ bool LosslessMetalRenderer::presentPacket(const std::uint8_t* packet,
     }
     outHashOk = (!verifyHash || hdr.hash_algo == sds::lossless::hash_algo_e::none) ? true : stats.hash_matched;
     outDecodeUs = static_cast<std::uint64_t>(timer.nsecsElapsed() / 1000);
-    outHashUs = 0;
+    outHashUs = stats.hash_us;
 
     const int w = m_CpuDecoder.width();
     const int h = m_CpuDecoder.height();
-    if (!m_Impl->ensureBuffers(w, h, 0, 0, true)) {
+    QMutexLocker lk2(&m_FrameMutex);
+    m_UsingGpuCompute = false;
+    m_Impl->hasPrev = false;
+    const int writeIdx = 1 - m_Impl->renderTexIdx;
+    if (!m_Impl->ensureBuffers(w, h, 0, 0, true, writeIdx)) {
         return false;
     }
     @autoreleasepool {
-        [m_Impl->videoTex replaceRegion:MTLRegionMake2D(0, 0, static_cast<NSUInteger>(w), static_cast<NSUInteger>(h))
-                            mipmapLevel:0
-                              withBytes:m_CpuDecoder.current_bgra()
-                            bytesPerRow:static_cast<NSUInteger>(m_CpuDecoder.stride())];
+        [m_Impl->videoTex[writeIdx] replaceRegion:MTLRegionMake2D(0, 0, static_cast<NSUInteger>(w), static_cast<NSUInteger>(h))
+                                      mipmapLevel:0
+                                        withBytes:m_CpuDecoder.current_bgra()
+                                      bytesPerRow:static_cast<NSUInteger>(m_CpuDecoder.stride())];
+        m_Impl->renderTexIdx = writeIdx;
         m_Impl->hasRenderTex = true;
     }
     return true;
@@ -619,8 +667,12 @@ void LosslessMetalRenderer::renderOnMainThread()
         id<MTLRenderCommandEncoder> re = [cmd renderCommandEncoderWithDescriptor:rpd];
 
         QMutexLocker lk(&m_FrameMutex);
-        if (m_Impl->hasRenderTex && m_Impl->videoTex && outW > 0 && outH > 0) {
-            SDL_Rect src {0, 0, m_Impl->texWidth, m_Impl->texHeight};
+        const int rIdx = m_Impl->renderTexIdx;
+        id<MTLTexture> activeTex = m_Impl->videoTex[rIdx];
+        const int vw = m_Impl->texWidth[rIdx];
+        const int vh = m_Impl->texHeight[rIdx];
+        if (m_Impl->hasRenderTex && activeTex && vw > 0 && vh > 0 && outW > 0 && outH > 0) {
+            SDL_Rect src {0, 0, vw, vh};
             SDL_Rect dst {0, 0, outW, outH};
             StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
 
@@ -634,17 +686,21 @@ void LosslessMetalRenderer::renderOnMainThread()
                 left, top, 0.0f, 0.0f,
                 right, top, 1.0f, 0.0f,
             };
-            const bool exact1to1 = (dst.w == m_Impl->texWidth && dst.h == m_Impl->texHeight);
+            const bool exact1to1 = (dst.w == vw && dst.h == vh);
             [re setRenderPipelineState:exact1to1 ? m_Impl->psoVideoNearest : m_Impl->psoVideoLinear];
             [re setVertexBytes:verts length:sizeof(verts) atIndex:0];
-            [re setFragmentTexture:m_Impl->videoTex atIndex:0];
+            [re setFragmentTexture:activeTex atIndex:0];
             [re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         }
 
         for (int i = 0; i < Overlay::OverlayMax; ++i) {
             const auto type = static_cast<Overlay::OverlayType>(i);
             if (m_OverlayManager && m_OverlayManager->isOverlayEnabled(type) && m_Impl->overlayTex[i] && outW > 0 && outH > 0) {
-                const SDL_Rect& r = m_Impl->overlayRect[i];
+                const int ow = m_Impl->overlayRect[i].w;
+                const int oh = m_Impl->overlayRect[i].h;
+                const SDL_Rect r = (type == Overlay::OverlayStatusUpdate)
+                    ? SDL_Rect {outW - ow - 10, outH - oh - 10, ow, oh}
+                    : SDL_Rect {10, 10, ow, oh};
                 const float left = (2.0f * r.x) / outW - 1.0f;
                 const float right = (2.0f * (r.x + r.w)) / outW - 1.0f;
                 const float top = 1.0f - (2.0f * r.y) / outH;

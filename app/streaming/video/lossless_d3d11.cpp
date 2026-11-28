@@ -11,7 +11,9 @@
 
 #include <SDL_syswm.h>
 
+#include <d3d10.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
@@ -187,8 +189,9 @@ void cs_copy_rects(uint3 gid : SV_DispatchThreadID) {
 
 [numthreads(32, 1, 1)]
 void cs_decode_tiles(uint3 tgid : SV_GroupID, uint lid : SV_GroupIndex) {
-    if (tgid.x >= dirty_tile_count) return;
-    DirtyTileDesc d = tile_descs[tgid.x];
+    uint tidx = tgid.y * 256u + tgid.x;
+    if (tidx >= dirty_tile_count) return;
+    DirtyTileDesc d = tile_descs[tidx];
     uint pixels = d.tile_w * d.tile_h;
     uint base = d.payload_offset;
 
@@ -329,12 +332,13 @@ Texture2D tex0 : register(t0);
 SamplerState samp0 : register(s0);
 
 VSOut vs_quad(uint id : SV_VertexID) {
-    float2 uvs[4] = { float2(0, 1), float2(1, 1), float2(0, 0), float2(1, 0) };
+    // Top-left, Top-right, Bottom-left, Bottom-right -> clockwise in D3D11 NDC (+Y up)
+    float2 uvs[4] = { float2(0, 0), float2(1, 0), float2(0, 1), float2(1, 1) };
     float2 pos[4] = {
-        float2(rect.x, rect.w),
-        float2(rect.z, rect.w),
         float2(rect.x, rect.y),
-        float2(rect.z, rect.y)
+        float2(rect.z, rect.y),
+        float2(rect.x, rect.w),
+        float2(rect.z, rect.w)
     };
     VSOut o;
     o.pos = float4(pos[id], 0.0, 1.0);
@@ -372,6 +376,7 @@ struct LosslessD3D11Renderer::Impl
     ComPtr<ID3D11SamplerState> sampNearest;
     ComPtr<ID3D11SamplerState> sampLinear;
     ComPtr<ID3D11BlendState> blendOverlay;
+    ComPtr<ID3D11RasterizerState> rsNoCull;
 
     ComPtr<ID3D11Buffer> cbParams;
     ComPtr<ID3D11Buffer> cbQuad;
@@ -404,6 +409,7 @@ struct LosslessD3D11Renderer::Impl
     std::size_t capRowBytes = 0;
     int texWidth = 0;
     int texHeight = 0;
+    bool texIsGpu = false;
     int backWidth = 0;
     int backHeight = 0;
     bool hasPrev = false;
@@ -464,7 +470,11 @@ bool LosslessD3D11Renderer::initialize(SDL_Window* window,
     }
 
     int outW = 0, outH = 0;
+#if SDL_VERSION_ATLEAST(2, 26, 0)
     SDL_GetWindowSizeInPixels(window, &outW, &outH);
+#else
+    SDL_GetWindowSize(window, &outW, &outH);
+#endif
     DXGI_SWAP_CHAIN_DESC1 scd {};
     scd.Width = std::max(outW, 1);
     scd.Height = std::max(outH, 1);
@@ -541,6 +551,16 @@ bool LosslessD3D11Renderer::initialize(SDL_Window* window,
     bld.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     m_Impl->device->CreateBlendState(&bld, &m_Impl->blendOverlay);
 
+    D3D11_RASTERIZER_DESC rd {};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    if (FAILED(m_Impl->device->CreateRasterizerState(&rd, &m_Impl->rsNoCull))) {
+        delete m_Impl;
+        m_Impl = nullptr;
+        return false;
+    }
+
     D3D11_BUFFER_DESC cbd {};
     cbd.ByteWidth = sizeof(D3DDecodeParams);
     cbd.Usage = D3D11_USAGE_DYNAMIC;
@@ -596,30 +616,36 @@ bool LosslessD3D11Renderer::presentPacket(const std::uint8_t* packet,
     const int h = static_cast<int>(hdr.height);
     const std::size_t frameBytes = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u;
 
-    auto ensureTex = [&]() -> bool {
-        if (m_Impl->texWidth == w && m_Impl->texHeight == h && m_Impl->videoTex) return true;
+    auto ensureTex = [&](bool gpuFmt) -> bool {
+        if (m_Impl->texWidth == w && m_Impl->texHeight == h && m_Impl->texIsGpu == gpuFmt && m_Impl->videoTex) return true;
+        m_Impl->videoTex.Reset();
+        m_Impl->videoTexSrv.Reset();
+        m_Impl->videoTexUav.Reset();
         D3D11_TEXTURE2D_DESC td {};
         td.Width = static_cast<UINT>(w);
         td.Height = static_cast<UINT>(h);
         td.MipLevels = 1;
         td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.Format = gpuFmt ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        td.BindFlags = gpuFmt ? (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS) : D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(m_Impl->device->CreateTexture2D(&td, nullptr, &m_Impl->videoTex))) return false;
         if (FAILED(m_Impl->device->CreateShaderResourceView(m_Impl->videoTex.Get(), nullptr, &m_Impl->videoTexSrv))) return false;
-        if (FAILED(m_Impl->device->CreateUnorderedAccessView(m_Impl->videoTex.Get(), nullptr, &m_Impl->videoTexUav))) return false;
+        if (gpuFmt && FAILED(m_Impl->device->CreateUnorderedAccessView(m_Impl->videoTex.Get(), nullptr, &m_Impl->videoTexUav))) return false;
         m_Impl->texWidth = w;
         m_Impl->texHeight = h;
+        m_Impl->texIsGpu = gpuFmt;
         return true;
     };
 
     if (!useGpuCompute) {
-        m_UsingGpuCompute = false;
-        m_Impl->hasPrev = false;
+        lk.unlock();
         sds::lossless::decode_stats_t stats {};
         if (!m_CpuDecoder.decode_frame(packet, len, verifyHash, nullptr, &stats)) {
+            QMutexLocker lk2(&m_FrameMutex);
+            m_UsingGpuCompute = false;
+            m_Impl->hasPrev = false;
             outHashOk = false;
             outDecodeUs = static_cast<std::uint64_t>(timer.nsecsElapsed() / 1000);
             outHashUs = 0;
@@ -627,8 +653,12 @@ bool LosslessD3D11Renderer::presentPacket(const std::uint8_t* packet,
         }
         outHashOk = (!verifyHash || hdr.hash_algo == sds::lossless::hash_algo_e::none) ? true : stats.hash_matched;
         outDecodeUs = static_cast<std::uint64_t>(timer.nsecsElapsed() / 1000);
-        outHashUs = 0;
-        if (!ensureTex()) return false;
+        outHashUs = stats.hash_us;
+
+        QMutexLocker lk2(&m_FrameMutex);
+        m_UsingGpuCompute = false;
+        m_Impl->hasPrev = false;
+        if (!ensureTex(false)) return false;
         m_Impl->ctx->UpdateSubresource(m_Impl->videoTex.Get(), 0, nullptr, m_CpuDecoder.current_bgra(),
                                        static_cast<UINT>(m_CpuDecoder.stride()), 0);
         m_Impl->hasFrame = true;
@@ -647,12 +677,30 @@ bool LosslessD3D11Renderer::presentPacket(const std::uint8_t* packet,
         outHashOk = false;
         return false;
     }
+    const int tilesX = (w + sds::lossless::TILE_SIZE - 1) / sds::lossless::TILE_SIZE;
+    const int tilesY = (h + sds::lossless::TILE_SIZE - 1) / sds::lossless::TILE_SIZE;
+    const std::size_t totalTiles = static_cast<std::size_t>(tilesX) * static_cast<std::size_t>(tilesY);
+    if (isKeyframe && (parsed.header.copy_rect_count != 0 || parsed.header.dirty_tile_count != totalTiles)) {
+        outHashOk = false;
+        return false;
+    }
     std::vector<sds::lossless::gpu_tile_desc_t> descs;
     if (!sds::lossless::build_dirty_tile_descs(parsed, packet, descs)) {
         outHashOk = false;
         return false;
     }
-    if (!ensureTex()) return false;
+    if (isKeyframe) {
+        for (const auto& d : descs) {
+            if (d.mode == static_cast<std::uint32_t>(sds::lossless::tile_mode_e::ycocgr_temporal_rice)) {
+                outHashOk = false;
+                return false;
+            }
+        }
+    }
+    if (!ensureTex(true)) {
+        m_Impl->hasPrev = false;
+        return false;
+    }
 
     // Ensure GPU structured/raw buffers
     if (frameBytes > m_Impl->capFrameBytes) {
@@ -673,6 +721,7 @@ bool LosslessD3D11Renderer::presentPacket(const std::uint8_t* packet,
         bd.Usage = D3D11_USAGE_STAGING;
         bd.BindFlags = 0;
         bd.MiscFlags = 0;
+        bd.StructureByteStride = 0;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(m_Impl->device->CreateBuffer(&bd, nullptr, &m_Impl->blake3Staging))) {
             return false;
@@ -733,6 +782,7 @@ bool LosslessD3D11Renderer::presentPacket(const std::uint8_t* packet,
         bd.Usage = D3D11_USAGE_STAGING;
         bd.BindFlags = 0;
         bd.MiscFlags = 0;
+        bd.StructureByteStride = 0;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(m_Impl->device->CreateBuffer(&bd, nullptr, &m_Impl->rowCrcStaging))) {
             return false;
@@ -782,8 +832,10 @@ bool LosslessD3D11Renderer::presentPacket(const std::uint8_t* packet,
         m_Impl->ctx->Dispatch((static_cast<UINT>(w) + 15u) / 16u, (static_cast<UINT>(h) + 15u) / 16u, 1u);
     }
     if (!descs.empty()) {
+        const UINT gx = static_cast<UINT>(std::min<std::size_t>(descs.size(), 256u));
+        const UINT gy = static_cast<UINT>((descs.size() + 255u) / 256u);
         m_Impl->ctx->CSSetShader(m_Impl->csDecodeTiles.Get(), nullptr, 0);
-        m_Impl->ctx->Dispatch(static_cast<UINT>(descs.size()), 1u, 1u);
+        m_Impl->ctx->Dispatch(gx, gy, 1u);
     }
     if (verifyHash && hdr.hash_algo == sds::lossless::hash_algo_e::crc32c) {
         m_Impl->ctx->CSSetShader(m_Impl->csCrc32c.Get(), nullptr, 0);
@@ -797,8 +849,7 @@ bool LosslessD3D11Renderer::presentPacket(const std::uint8_t* packet,
     m_Impl->ctx->CSSetUnorderedAccessViews(0, 3, nullU, nullptr);
     m_Impl->ctx->CSSetShaderResources(0, 4, nullS);
 
-    m_Impl->ctx->CopyResource(m_Impl->prevBuf.Get(), m_Impl->currBuf.Get());
-
+    bool mapOk = true;
     QElapsedTimer htimer;
     htimer.start();
     outHashOk = true;
@@ -819,6 +870,7 @@ bool LosslessD3D11Renderer::presentPacket(const std::uint8_t* packet,
                 (static_cast<std::uint32_t>(hdr.frame_hash[3]) << 24);
             outHashOk = (combined == expected);
         } else {
+            mapOk = false;
             outHashOk = false;
         }
     } else if (verifyHash && hdr.hash_algo == sds::lossless::hash_algo_e::blake3) {
@@ -830,11 +882,17 @@ bool LosslessD3D11Renderer::presentPacket(const std::uint8_t* packet,
             m_Impl->ctx->Unmap(m_Impl->blake3Staging.Get(), 0);
             outHashOk = (b3 == hdr.frame_hash);
         } else {
+            mapOk = false;
             outHashOk = false;
         }
     }
     outHashUs = static_cast<std::uint64_t>(htimer.nsecsElapsed() / 1000);
     outDecodeUs = static_cast<std::uint64_t>(timer.nsecsElapsed() / 1000);
+    if (!mapOk) {
+        m_Impl->hasPrev = false;
+        return false;
+    }
+    m_Impl->ctx->CopyResource(m_Impl->prevBuf.Get(), m_Impl->currBuf.Get());
     m_Impl->hasPrev = true;
     m_Impl->hasFrame = true;
     return true;
@@ -845,7 +903,11 @@ void LosslessD3D11Renderer::renderOnMainThread()
     if (!m_Impl || !m_Impl->swapChain) return;
 
     int outW = 0, outH = 0;
+#if SDL_VERSION_ATLEAST(2, 26, 0)
     SDL_GetWindowSizeInPixels(m_Window, &outW, &outH);
+#else
+    SDL_GetWindowSize(m_Window, &outW, &outH);
+#endif
 
     const int overlayRefW = (outW > 0) ? outW : m_Impl->backWidth;
     const int overlayRefH = (outH > 0) ? outH : m_Impl->backHeight;
@@ -882,13 +944,17 @@ void LosslessD3D11Renderer::renderOnMainThread()
 
     if (outW > 0 && outH > 0 && (outW != m_Impl->backWidth || outH != m_Impl->backHeight)) {
         m_Impl->rtv.Reset();
-        m_Impl->swapChain->ResizeBuffers(0, static_cast<UINT>(outW), static_cast<UINT>(outH), DXGI_FORMAT_UNKNOWN, 0);
-        ComPtr<ID3D11Texture2D> backBuf;
-        if (SUCCEEDED(m_Impl->swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuf)))) {
-            m_Impl->device->CreateRenderTargetView(backBuf.Get(), nullptr, &m_Impl->rtv);
+        if (SUCCEEDED(m_Impl->swapChain->ResizeBuffers(0, static_cast<UINT>(outW), static_cast<UINT>(outH), DXGI_FORMAT_UNKNOWN, 0))) {
+            ComPtr<ID3D11Texture2D> backBuf;
+            if (SUCCEEDED(m_Impl->swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuf))) &&
+                SUCCEEDED(m_Impl->device->CreateRenderTargetView(backBuf.Get(), nullptr, &m_Impl->rtv))) {
+                m_Impl->backWidth = outW;
+                m_Impl->backHeight = outH;
+            }
         }
-        m_Impl->backWidth = outW;
-        m_Impl->backHeight = outH;
+    }
+    if (!m_Impl->rtv) {
+        return;
     }
 
     const float clear[4] = { 0.f, 0.f, 0.f, 1.f };
@@ -897,6 +963,9 @@ void LosslessD3D11Renderer::renderOnMainThread()
 
     D3D11_VIEWPORT vp { 0.f, 0.f, static_cast<float>(m_Impl->backWidth), static_cast<float>(m_Impl->backHeight), 0.f, 1.f };
     m_Impl->ctx->RSSetViewports(1, &vp);
+    if (m_Impl->rsNoCull) {
+        m_Impl->ctx->RSSetState(m_Impl->rsNoCull.Get());
+    }
     m_Impl->ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     m_Impl->ctx->IASetInputLayout(nullptr);
     m_Impl->ctx->VSSetShader(m_Impl->vsQuad.Get(), nullptr, 0);
@@ -931,14 +1000,25 @@ void LosslessD3D11Renderer::renderOnMainThread()
     for (int i = 0; i < Overlay::OverlayMax; ++i) {
         const auto type = static_cast<Overlay::OverlayType>(i);
         if (m_OverlayManager && m_OverlayManager->isOverlayEnabled(type) && m_Impl->overlaySrv[i]) {
-            drawQuad(m_Impl->overlayRect[i], m_Impl->overlaySrv[i].Get(), m_Impl->psOverlay.Get(), m_Impl->sampNearest.Get(), true);
+            const int ow = m_Impl->overlayRect[i].w;
+            const int oh = m_Impl->overlayRect[i].h;
+            const SDL_Rect orect = (type == Overlay::OverlayStatusUpdate)
+                ? SDL_Rect { m_Impl->backWidth - ow - 10, m_Impl->backHeight - oh - 10, ow, oh }
+                : SDL_Rect { 10, 10, ow, oh };
+            drawQuad(orect, m_Impl->overlaySrv[i].Get(), m_Impl->psOverlay.Get(), m_Impl->sampNearest.Get(), true);
         }
     }
 
     ID3D11ShaderResourceView* nullS[1] = { nullptr };
     m_Impl->ctx->PSSetShaderResources(0, 1, nullS);
-    m_Impl->swapChain->Present(m_Impl->enableVsync ? 1u : 0u, 0u);
+    IDXGISwapChain1* sc = m_Impl->swapChain.Get();
+    const UINT syncInt = m_Impl->enableVsync ? 1u : 0u;
     lk.unlock();
+    const HRESULT phr = sc->Present(syncInt, 0u);
+    if (FAILED(phr) && phr != DXGI_STATUS_OCCLUDED) {
+        QMutexLocker lk2(&m_FrameMutex);
+        m_Impl->hasPrev = false;
+    }
 }
 
 bool LosslessD3D11Renderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)

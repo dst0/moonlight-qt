@@ -77,7 +77,8 @@ public:
             }
             m_CrcTable = [m_Device newBufferWithBytes:tbl.data() length:sizeof(tbl) options:MTLResourceStorageModeShared];
             m_Params = [m_Device newBufferWithLength:sizeof(TestDecodeParams) options:MTLResourceStorageModeShared];
-            return m_CrcTable && m_Params;
+            m_ErrFlag = [m_Device newBufferWithLength:sizeof(std::uint32_t) options:MTLResourceStorageModeShared];
+            return m_CrcTable && m_Params && m_ErrFlag;
         }
     }
 
@@ -90,6 +91,7 @@ public:
         [m_RowCrcs release];
         [m_CrcTable release];
         [m_Params release];
+        [m_ErrFlag release];
         [m_Copy release];
         [m_Decode release];
         [m_Crc release];
@@ -110,8 +112,18 @@ public:
         const int w = outHdr.width, h = outHdr.height, stride = w * 4;
         if (!isKey && (!m_HasPrev || w != m_W || h != m_H)) return false;
 
+        const int tilesX = (w + sds::lossless::TILE_SIZE - 1) / sds::lossless::TILE_SIZE;
+        const int tilesY = (h + sds::lossless::TILE_SIZE - 1) / sds::lossless::TILE_SIZE;
+        const std::size_t totalTiles = static_cast<std::size_t>(tilesX) * static_cast<std::size_t>(tilesY);
+        if (isKey && (outHdr.copy_rect_count != 0 || outHdr.dirty_tile_count != totalTiles)) return false;
+
         std::vector<sds::lossless::gpu_tile_desc_t> descs;
         if (!sds::lossless::build_dirty_tile_descs(parsed, packet.data(), descs)) return false;
+        if (isKey) {
+            for (const auto& d : descs) {
+                if (d.mode == static_cast<std::uint32_t>(sds::lossless::tile_mode_e::ycocgr_temporal_rice)) return false;
+            }
+        }
 
         const std::size_t frameBytes = static_cast<std::size_t>(stride) * h;
         if (frameBytes > m_CapFrame) {
@@ -143,6 +155,8 @@ public:
             std::memcpy([m_Desc contents], descs.data(), descs.size() * sizeof(sds::lossless::gpu_tile_desc_t));
         }
 
+        *static_cast<std::uint32_t*>([m_ErrFlag contents]) = 0u;
+
         auto* params = static_cast<TestDecodeParams*>([m_Params contents]);
         std::memset(params, 0, sizeof(*params));
         params->width = outHdr.width; params->height = outHdr.height; params->stride = static_cast<std::uint32_t>(stride);
@@ -166,12 +180,15 @@ public:
                threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
             }
             if (!descs.empty()) {
+                const NSUInteger gx = std::min<NSUInteger>(descs.size(), 256u);
+                const NSUInteger gy = (descs.size() + 255u) / 256u;
                 [ce setComputePipelineState:m_Decode];
                 [ce setBuffer:m_Pkt offset:0 atIndex:0];
                 [ce setBuffer:m_Desc offset:0 atIndex:1];
                 [ce setBuffer:m_Curr offset:0 atIndex:2];
                 [ce setBuffer:m_Params offset:0 atIndex:3];
-                [ce dispatchThreadgroups:MTLSizeMake(descs.size(), 1, 1)
+                [ce setBuffer:m_ErrFlag offset:0 atIndex:4];
+                [ce dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             }
             if (outHdr.hash_algo == sds::lossless::hash_algo_e::crc32c) {
@@ -186,7 +203,8 @@ public:
             [ce endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
-            if ([cmd status] != MTLCommandBufferStatusCompleted) return false;
+            if ([cmd status] != MTLCommandBufferStatusCompleted ||
+                *static_cast<const std::uint32_t*>([m_ErrFlag contents]) != 0u) return false;
         }
 
         outBgra.resize(frameBytes);
@@ -219,7 +237,7 @@ private:
     id<MTLDevice> m_Device = nil;
     id<MTLCommandQueue> m_Queue = nil;
     id<MTLComputePipelineState> m_Copy = nil, m_Decode = nil, m_Crc = nil;
-    id<MTLBuffer> m_Prev = nil, m_Curr = nil, m_Pkt = nil, m_Desc = nil, m_RowCrcs = nil, m_CrcTable = nil, m_Params = nil;
+    id<MTLBuffer> m_Prev = nil, m_Curr = nil, m_Pkt = nil, m_Desc = nil, m_RowCrcs = nil, m_CrcTable = nil, m_Params = nil, m_ErrFlag = nil;
     std::size_t m_CapFrame = 0, m_CapPkt = 0, m_CapDesc = 0, m_CapRow = 0;
     int m_W = 0, m_H = 0;
     bool m_HasPrev = false;
@@ -394,6 +412,34 @@ private slots:
             QVERIFY(hOk2);
             assertRgb24Match(gpuOut2, stride, frame, stride, w, h);
         }
+    }
+
+    void malformedKeyframeRejected()
+    {
+        const QString metalPath = QFINDTESTDATA("../../app/shaders/sds_lossless.metal");
+        QVERIFY2(!metalPath.isEmpty(), "Could not locate app/shaders/sds_lossless.metal");
+        HeadlessMetalDecoder gpuDec;
+        QVERIFY(gpuDec.init(metalPath));
+
+        const int w = 128, h = 96;
+        const int stride = w * 4;
+        std::vector<std::uint8_t> f1(static_cast<std::size_t>(stride) * h, 0x20);
+        std::vector<std::uint8_t> f2 = f1;
+        f2[0] = 0xEE; f2[1] = 0x11; f2[2] = 0x44;
+
+        sds::lossless::cpu_encoder_t cpuEnc(1);
+        std::vector<std::uint8_t> kPkt, dPkt;
+        QVERIFY(cpuEnc.encode_frame(f1.data(), stride, w, h, 1, 1000,
+                                    sds::lossless::hash_algo_e::crc32c, true, kPkt));
+        QVERIFY(cpuEnc.encode_frame(f2.data(), stride, w, h, 2, 2000,
+                                    sds::lossless::hash_algo_e::crc32c, false, dPkt));
+        QVERIFY(dPkt.size() >= sds::lossless::HEADER_SIZE);
+        dPkt[6] |= static_cast<std::uint8_t>(sds::lossless::FLAG_KEYFRAME & 0xFFu);
+
+        std::vector<std::uint8_t> finalOut;
+        sds::lossless::frame_header_t dh {};
+        bool hOk = false;
+        QVERIFY(!gpuDec.decode(dPkt, finalOut, dh, hOk));
     }
 };
 

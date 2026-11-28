@@ -602,6 +602,9 @@ CenteredGridView {
             if (key === "revertHostResolution") {
                 return effectiveMatchHostRes
             }
+            if (key === "losslessMode") {
+                return pcDialog.supportsLosslessVideo
+            }
             return true
         }
 

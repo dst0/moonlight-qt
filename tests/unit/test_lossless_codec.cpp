@@ -431,6 +431,111 @@ private slots:
         QVERIFY(client.hadPinFailure());
         QVERIFY(!client.isConnected());
     }
+
+    void malformedKeyframeAndHashTiming()
+    {
+        const int w = 128, h = 96;
+        std::vector<uint8_t> f1 = makeSolidBgra(w, h, 20, 40, 60);
+        std::vector<uint8_t> f2 = f1;
+        fillRectBgra(f2, w, 0, 0, 32, 32, 200, 100, 50);
+
+        sds::lossless::cpu_encoder_t enc(1);
+        sds::lossless::cpu_decoder_t dec(1);
+        std::vector<uint8_t> pkt1, pkt2;
+        sds::lossless::decode_stats_t dstats {};
+
+        QVERIFY(enc.encode_frame(f1.data(), w * 4, w, h, 1, 1000,
+                                 sds::lossless::hash_algo_e::crc32c, true, pkt1));
+        QVERIFY(dec.decode_frame(pkt1.data(), pkt1.size(), true, nullptr, &dstats));
+        QVERIFY(dstats.hash_verified);
+        QVERIFY(dstats.hash_matched);
+        QVERIFY(dstats.hash_us < 1000000u);
+
+        QVERIFY(enc.encode_frame(f2.data(), w * 4, w, h, 2, 2000,
+                                 sds::lossless::hash_algo_e::blake3, false, pkt2));
+        // Mutate delta packet flags (byte offset 6) to claim FLAG_KEYFRAME -> decoder must reject incomplete tile coverage
+        std::vector<uint8_t> bad = pkt2;
+        bad[6] |= static_cast<uint8_t>(sds::lossless::FLAG_KEYFRAME & 0xFFu);
+        QVERIFY(!dec.decode_frame(bad.data(), bad.size(), false, nullptr, nullptr));
+    }
+
+    void blake3MultiChunkBoundaries()
+    {
+        for (std::size_t pixels : {std::size_t {341}, std::size_t {342}, std::size_t {683}, std::size_t {1025}, std::size_t {3414}}) {
+            const int w = static_cast<int>(pixels);
+            std::vector<std::uint8_t> rgb(pixels * 3u);
+            std::vector<std::uint8_t> bgra(pixels * 4u);
+            for (std::size_t i = 0; i < pixels; ++i) {
+                const std::uint8_t r = static_cast<std::uint8_t>((i * 41u + 7u) & 0xFFu);
+                const std::uint8_t g = static_cast<std::uint8_t>((i * 73u + 19u) & 0xFFu);
+                const std::uint8_t b = static_cast<std::uint8_t>((i * 19u + 93u) & 0xFFu);
+                rgb[i * 3u + 0] = r;
+                rgb[i * 3u + 1] = g;
+                rgb[i * 3u + 2] = b;
+                bgra[i * 4u + 0] = b;
+                bgra[i * 4u + 1] = g;
+                bgra[i * 4u + 2] = r;
+                bgra[i * 4u + 3] = static_cast<std::uint8_t>(i & 0xFFu);
+            }
+            const auto oneShot = sds::lossless::blake3_hash(rgb.data(), rgb.size());
+            const auto fromBgra = sds::lossless::blake3_rgb24_from_bgra(bgra.data(), w * 4, w, 1);
+            QCOMPARE(fromBgra, oneShot);
+
+            bgra[pixels * 4u - 2u] ^= 0x01u;
+            QVERIFY(sds::lossless::blake3_rgb24_from_bgra(bgra.data(), w * 4, w, 1) != oneShot);
+        }
+    }
+
+    void clientRejects101WithoutConnectionUpgrade()
+    {
+        const TestCert hostCert = TestCerts::makeSelfSigned("host-no-conn");
+        const TestCert clientCert = TestCerts::makeSelfSigned("cli-no-conn");
+
+        QSslConfiguration srvCfg = QSslConfiguration::defaultConfiguration();
+        srvCfg.setLocalCertificate(hostCert.cert());
+        srvCfg.setPrivateKey(hostCert.key());
+        srvCfg.setCaCertificates({clientCert.cert()});
+        srvCfg.setPeerVerifyMode(QSslSocket::VerifyPeer);
+
+        QSslServer server;
+        server.setSslConfiguration(srvCfg);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+        QByteArray rxBuf;
+        QObject::connect(&server, &QSslServer::pendingConnectionAvailable, &server, [&]() {
+            while (QTcpSocket* sock = server.nextPendingConnection()) {
+                QObject::connect(sock, &QTcpSocket::readyRead, &server, [&, sock]() {
+                    rxBuf.append(sock->readAll());
+                    if (rxBuf.contains("\r\n\r\n")) {
+                        sock->write("HTTP/1.1 101 Switching Protocols\r\n"
+                                    "Upgrade: sds-lossless-v1\r\n\r\n");
+                        sock->flush();
+                        rxBuf.clear();
+                    }
+                });
+            }
+        });
+
+        SdsLosslessClient::Config cfg;
+        cfg.host = QStringLiteral("127.0.0.1");
+        cfg.httpsPort = server.serverPort();
+        cfg.serverCert = hostCert.cert();
+        cfg.clientCert = clientCert.cert();
+        cfg.clientKey = clientCert.key();
+
+        SdsLosslessClient client(cfg);
+        client.start();
+
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < 2000 && client.lastError().isEmpty()) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        }
+        client.stop();
+
+        QVERIFY(!client.isConnected());
+        QVERIFY(!client.lastError().isEmpty());
+    }
 };
 
 int runLosslessCodecTests(int argc, char** argv)

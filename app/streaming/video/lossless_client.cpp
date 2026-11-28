@@ -51,15 +51,28 @@ public:
         cleanupSocket();
     }
 
+    void signalStop()
+    {
+        m_Stopped.store(true, std::memory_order_release);
+    }
+
 public slots:
     void startWorker()
     {
-        if (m_Stopped) {
+        if (m_Stopped.load(std::memory_order_acquire)) {
             return;
         }
         m_RetryTimer = new QTimer(this);
         m_RetryTimer->setSingleShot(true);
         connect(m_RetryTimer, &QTimer::timeout, this, &SdsLosslessWorker::connectOnce);
+
+        m_HandshakeTimer = new QTimer(this);
+        m_HandshakeTimer->setSingleShot(true);
+        connect(m_HandshakeTimer, &QTimer::timeout, this, [this]() {
+            if (!m_Stopped.load(std::memory_order_acquire) && m_Socket && !m_Upgraded) {
+                abortAndReconnect(QStringLiteral("Lossless TLS/HTTP upgrade timed out"));
+            }
+        });
 
         QHostAddress addr;
         if (!addr.setAddress(m_Cfg.host) || !LanPolicy::isPermittedConnectionTarget(addr)) {
@@ -77,15 +90,22 @@ public slots:
 
     void stopWorker()
     {
-        m_Stopped = true;
+        m_Stopped.store(true, std::memory_order_release);
         if (m_RetryTimer) {
             m_RetryTimer->stop();
+        }
+        if (m_HandshakeTimer) {
+            m_HandshakeTimer->stop();
         }
         cleanupSocket();
     }
 
     void sendControlSlot(quint8 msgType, quint32 arg)
     {
+        if (msgType == static_cast<quint8>(sds::lossless::control_msg_e::set_hash_algo) &&
+            arg <= static_cast<quint32>(sds::lossless::hash_algo_e::blake3)) {
+            m_Cfg.hashAlgo = static_cast<sds::lossless::hash_algo_e>(arg);
+        }
         if (!m_Socket || !m_Upgraded || m_Socket->state() != QAbstractSocket::ConnectedState) {
             return;
         }
@@ -101,7 +121,7 @@ public slots:
 
     void resumeReading()
     {
-        if (m_Stopped || !m_ReadPaused) {
+        if (m_Stopped.load(std::memory_order_acquire) || !m_ReadPaused) {
             return;
         }
         m_ReadPaused = false;
@@ -111,7 +131,7 @@ public slots:
 private slots:
     void connectOnce()
     {
-        if (m_Stopped) {
+        if (m_Stopped.load(std::memory_order_acquire)) {
             return;
         }
         cleanupSocket();
@@ -131,7 +151,7 @@ private slots:
         sslCfg.setPeerVerifyMode(QSslSocket::VerifyPeer);
         m_Socket->setSslConfiguration(sslCfg);
 
-        connect(m_Socket, &QSslSocket::sslErrors, this, [this](const QList<QSslError>& errors) {
+        connect(m_Socket, QOverload<const QList<QSslError>&>::of(&QSslSocket::sslErrors), this, [this](const QList<QSslError>& errors) {
             if (!m_Socket) {
                 return;
             }
@@ -145,7 +165,7 @@ private slots:
         });
 
         connect(m_Socket, &QSslSocket::encrypted, this, [this]() {
-            if (!m_Socket || m_Stopped) {
+            if (!m_Socket || m_Stopped.load(std::memory_order_acquire)) {
                 return;
             }
             if (!CertPinning::matchesPinned(m_Cfg.serverCert, m_Socket->peerCertificate())) {
@@ -179,11 +199,17 @@ private slots:
         });
 #endif
 
+        if (m_HandshakeTimer) {
+            m_HandshakeTimer->start(7000);
+        }
         m_Socket->connectToHostEncrypted(m_Cfg.host, m_Cfg.httpsPort);
     }
 
     void handleSocketClosed()
     {
+        if (m_HandshakeTimer) {
+            m_HandshakeTimer->stop();
+        }
         if (m_Socket && m_Socket->error() != QAbstractSocket::UnknownSocketError) {
             QMutexLocker lk(&m_Owner->m_StateMutex);
             m_Owner->m_LastError = m_Socket->errorString();
@@ -195,11 +221,15 @@ private slots:
 
     void drainSocket()
     {
-        if (!m_Socket || m_Stopped || m_ReadPaused) {
+        if (!m_Socket || m_Stopped.load(std::memory_order_acquire) || m_ReadPaused) {
             return;
         }
 
         if (m_Socket->bytesAvailable() > 0) {
+            if (m_RxBuffer.size() + m_Socket->bytesAvailable() > static_cast<qint64>(sds::lossless::MAX_PAYLOAD_BYTES + sds::lossless::HEADER_SIZE + 8192)) {
+                abortAndReconnect(QStringLiteral("Oversized SDLL receive buffer"));
+                return;
+            }
             m_RxBuffer.append(m_Socket->readAll());
         }
 
@@ -221,12 +251,13 @@ private slots:
                 return;
             }
             const QByteArray statusLine = lines.first().trimmed();
-            if (!statusLine.startsWith("HTTP/1.1 101")) {
+            if (statusLine != "HTTP/1.1 101" && !statusLine.startsWith("HTTP/1.1 101 ")) {
                 abortAndReconnect(QStringLiteral("Unexpected upgrade status: %1").arg(QString::fromLatin1(statusLine)));
                 return;
             }
 
             bool hasUpgradeHeader = false;
+            bool hasConnectionUpgrade = false;
             for (int i = 1; i < lines.size(); ++i) {
                 const QByteArray line = lines[i].trimmed();
                 const int colon = line.indexOf(':');
@@ -237,13 +268,24 @@ private slots:
                 const QByteArray val = line.mid(colon + 1).trimmed();
                 if (equalsIgnoreCase(name, "Upgrade") && equalsIgnoreCase(val, "sds-lossless-v1")) {
                     hasUpgradeHeader = true;
+                } else if (equalsIgnoreCase(name, "Connection")) {
+                    const QList<QByteArray> parts = val.split(',');
+                    for (const QByteArray& part : parts) {
+                        if (equalsIgnoreCase(part.trimmed(), "upgrade")) {
+                            hasConnectionUpgrade = true;
+                            break;
+                        }
+                    }
                 }
             }
-            if (!hasUpgradeHeader) {
-                abortAndReconnect(QStringLiteral("Missing Upgrade: sds-lossless-v1 header"));
+            if (!hasUpgradeHeader || !hasConnectionUpgrade) {
+                abortAndReconnect(QStringLiteral("Missing Upgrade/Connection headers on 101 response"));
                 return;
             }
 
+            if (m_HandshakeTimer) {
+                m_HandshakeTimer->stop();
+            }
             m_Upgraded = true;
             m_Owner->setConnectedState(true);
 
@@ -265,8 +307,10 @@ private slots:
                 return;
             }
 
-            const std::uint64_t maxPayload = maxPlausiblePayloadBytes(hdr.width, hdr.height);
-            if (hdr.payload_len > maxPayload || hdr.payload_len > (512ull * 1024ull * 1024ull)) {
+            const std::uint64_t maxPayload = std::min<std::uint64_t>(
+                maxPlausiblePayloadBytes(hdr.width, hdr.height),
+                sds::lossless::MAX_PAYLOAD_BYTES);
+            if (hdr.payload_len > maxPayload) {
                 abortAndReconnect(QStringLiteral("Implausible SDLL payload length"));
                 return;
             }
@@ -297,6 +341,9 @@ private slots:
 private:
     void cleanupSocket()
     {
+        if (m_HandshakeTimer) {
+            m_HandshakeTimer->stop();
+        }
         if (m_Socket) {
             m_Socket->disconnect(this);
             m_Socket->abort();
@@ -319,7 +366,7 @@ private:
 
     void scheduleReconnect()
     {
-        if (m_Stopped || m_Owner->hadPinFailure()) {
+        if (m_Stopped.load(std::memory_order_acquire) || m_Owner->hadPinFailure()) {
             return;
         }
         if (m_RetryTimer && !m_RetryTimer->isActive()) {
@@ -332,8 +379,9 @@ private:
     SdsLosslessClient::Config m_Cfg;
     QSslSocket* m_Socket = nullptr;
     QTimer* m_RetryTimer = nullptr;
+    QTimer* m_HandshakeTimer = nullptr;
     QByteArray m_RxBuffer;
-    bool m_Stopped = false;
+    std::atomic_bool m_Stopped {false};
     bool m_Upgraded = false;
     bool m_ReadPaused = false;
     int m_RetryDelayMs = 50;
@@ -365,6 +413,12 @@ void SdsLosslessClient::start()
     QMetaObject::invokeMethod(m_Worker, "startWorker", Qt::QueuedConnection);
 }
 
+void SdsLosslessClient::wakeWaiters()
+{
+    QMutexLocker lk(&m_StateMutex);
+    m_FrameCond.wakeAll();
+}
+
 void SdsLosslessClient::stop()
 {
     {
@@ -376,14 +430,19 @@ void SdsLosslessClient::stop()
         m_Queue.clear();
         m_FrameCond.wakeAll();
     }
+    if (m_Worker) {
+        m_Worker->signalStop();
+    }
     if (m_Thread.isRunning()) {
-        QMetaObject::invokeMethod(m_Worker, "stopWorker", Qt::BlockingQueuedConnection);
+        if (m_Worker) {
+            QMetaObject::invokeMethod(m_Worker, "stopWorker", Qt::BlockingQueuedConnection);
+        }
         m_Thread.quit();
         m_Thread.wait();
     } else if (m_Worker) {
         delete m_Worker;
-        m_Worker = nullptr;
     }
+    m_Worker = nullptr;
 }
 
 void SdsLosslessClient::requestKeyframe()

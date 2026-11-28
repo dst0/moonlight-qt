@@ -35,7 +35,7 @@ namespace sds::lossless {
   inline constexpr int GPU_TILE_SLOT_STRIDE = 3088;              // 16-byte aligned fixed slot for GPU shaders
   inline constexpr int MAX_COPY_RECTS = 4;
   inline constexpr int MAX_FRAME_DIM = 16384;
-  inline constexpr std::size_t MAX_PAYLOAD_BYTES = 64u * 1024u * 1024u;
+  inline constexpr std::size_t MAX_PAYLOAD_BYTES = 128u * 1024u * 1024u;
   inline constexpr int RICE_ESCAPE_Q = 16;
 
   inline constexpr std::uint16_t FLAG_KEYFRAME = 0x0001u;
@@ -115,6 +115,7 @@ namespace sds::lossless {
     bool hash_matched = false;
     std::uint32_t dirty_tiles = 0;
     std::uint32_t copy_rects = 0;
+    std::uint64_t hash_us = 0;
     std::array<std::uint8_t, 32> computed_hash {};
   };
 

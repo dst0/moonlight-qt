@@ -152,6 +152,17 @@ void Session::clConnectionTerminated(int errorCode)
     SDL_PushEvent(&event);
 }
 
+void Session::terminateWithError(const QString& message)
+{
+    m_UnexpectedTermination = true;
+    emit displayLaunchError(message);
+
+    SDL_Event event {};
+    event.type = SDL_QUIT;
+    event.quit.timestamp = SDL_GetTicks();
+    SDL_PushEvent(&event);
+}
+
 void Session::clLogMessage(const char* format, ...)
 {
     va_list ap;
@@ -1302,11 +1313,11 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         emitLaunchWarning(tr("Your selection to enable remote desktop mouse mode may cause problems in games."));
     }
 
-    if (m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_FORCE_SOFTWARE) {
+    if (!m_LosslessModeActive && m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_FORCE_SOFTWARE) {
         emitLaunchWarning(tr("Your settings selection to force software decoding may cause poor streaming performance."));
     }
 
-    if (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_AV1) {
+    if (!m_LosslessModeActive && (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_AV1)) {
         if (m_SupportedVideoFormats.maskByServerCodecModes(effectiveCodecModeSupport & SCM_MASK_AV1) == 0) {
             if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_AV1) {
                 emitLaunchWarning(tr("Your host software or GPU doesn't support encoding AV1."));
@@ -1336,7 +1347,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         }
     }
 
-    if (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_H265) {
+    if (!m_LosslessModeActive && (m_SupportedVideoFormats & VIDEO_FORMAT_MASK_H265)) {
         if (!hostHevcSupported) {
             if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_HEVC) {
                 emitLaunchWarning(tr("Your host PC doesn't support encoding HEVC."));
@@ -1367,7 +1378,8 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         }
     }
 
-    if (!(m_SupportedVideoFormats & ~VIDEO_FORMAT_MASK_H264) &&
+    if (!m_LosslessModeActive &&
+            !(m_SupportedVideoFormats & ~VIDEO_FORMAT_MASK_H264) &&
             m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_AUTO &&
             getDecoderAvailability(testWindow,
                                    m_Preferences->videoDecoderSelection,
@@ -1458,7 +1470,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         }
     }
 
-    if (m_Preferences->enableYUV444 && !m_UsePackedYCoCgRA1 && !m_AdaptiveRefinementActive) {
+    if (!m_LosslessModeActive && m_Preferences->enableYUV444 && !m_UsePackedYCoCgRA1 && !m_AdaptiveRefinementActive) {
         if (!(effectiveCodecModeSupport & SCM_MASK_YUV444)) {
             if (m_Packed444Decision.userWarning.isEmpty()) {
                 emitLaunchWarning(tr("Your host PC doesn't support YUV 4:4:4 streaming."));
@@ -1553,7 +1565,8 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         }
     }
 
-    if (m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_FORCE_HARDWARE &&
+    if (!m_LosslessModeActive &&
+            m_Preferences->videoDecoderSelection == StreamingPreferences::VDS_FORCE_HARDWARE &&
             (!(m_SupportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) || m_UsePackedYCoCgRA1) && // HDR was already checked for hardware decode support above
             getDecoderAvailability(testWindow,
                                    m_Preferences->videoDecoderSelection,
