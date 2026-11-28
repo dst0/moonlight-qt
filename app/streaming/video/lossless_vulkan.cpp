@@ -504,10 +504,10 @@ bool LosslessVulkanRenderer::presentPacket(const std::uint8_t* packet,
                 dummyUs);
         }
     }
-#endif
     if (m_Impl) {
         m_Impl->hasPrev = false;
     }
+#endif
     m_UsingGpuCompute = false;
     return m_Presenter.presentPacket(packet, len, hdr, false, verifyHash, outHashOk, outDecodeUs, outHashUs);
 }
