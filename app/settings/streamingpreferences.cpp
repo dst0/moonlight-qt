@@ -75,6 +75,11 @@
 #define SER_HOSTPLAYAUDIO "hostplayaudio"
 #define SER_SDSMATCHHOSTRES "sdsmatchhostres"
 #define SER_SDSREVERTHOSTRES "sdsreverthostres"
+#define SER_SDSLOSSLESSMODE "sdslosslessmode"
+#define SER_SDSLOSSLESSDECODER "sdslosslessdecoder"
+#define SER_SDSLOSSLESSHASH "sdslosslesshash"
+#define SER_SDSLOSSLESSHOSTENC "sdslosslesshostenc"
+#define SER_SDSHOSTLOSSLESSOVERRIDES "sdshostlosslessoverrides"
 
 #define CURRENT_DEFAULT_VER 2
 
@@ -221,6 +226,25 @@ void StreamingPreferences::reload()
     hostPlayAudioOverrides = settings.value(SER_HOSTPLAYAUDIO, QVariantMap()).toMap();
     matchHostResolution = settings.value(SER_SDSMATCHHOSTRES, false).toBool();
     revertHostResolution = settings.value(SER_SDSREVERTHOSTRES, false).toBool();
+
+    // secure-desktop-stream: true bit-exact SDLL v1 lossless video mode
+    enableLosslessMode = settings.value(SER_SDSLOSSLESSMODE, false).toBool();
+    int rawLosslessDec = settings.value(SER_SDSLOSSLESSDECODER, static_cast<int>(LosslessDecoderMode::LDM_AUTO)).toInt();
+    if (rawLosslessDec < static_cast<int>(LosslessDecoderMode::LDM_AUTO) || rawLosslessDec > static_cast<int>(LosslessDecoderMode::LDM_CPU)) {
+        rawLosslessDec = static_cast<int>(LosslessDecoderMode::LDM_AUTO);
+    }
+    losslessDecoderMode = static_cast<LosslessDecoderMode>(rawLosslessDec);
+    int rawLosslessHash = settings.value(SER_SDSLOSSLESSHASH, static_cast<int>(LosslessHashMode::LHM_CRC32C)).toInt();
+    if (rawLosslessHash < static_cast<int>(LosslessHashMode::LHM_CRC32C) || rawLosslessHash > static_cast<int>(LosslessHashMode::LHM_OFF)) {
+        rawLosslessHash = static_cast<int>(LosslessHashMode::LHM_CRC32C);
+    }
+    losslessHashMode = static_cast<LosslessHashMode>(rawLosslessHash);
+    int rawLosslessHostEnc = settings.value(SER_SDSLOSSLESSHOSTENC, static_cast<int>(LosslessHostEncoderMode::LHEM_AUTO)).toInt();
+    if (rawLosslessHostEnc < static_cast<int>(LosslessHostEncoderMode::LHEM_AUTO) || rawLosslessHostEnc > static_cast<int>(LosslessHostEncoderMode::LHEM_CPU)) {
+        rawLosslessHostEnc = static_cast<int>(LosslessHostEncoderMode::LHEM_AUTO);
+    }
+    losslessHostEncoderMode = static_cast<LosslessHostEncoderMode>(rawLosslessHostEnc);
+    hostLosslessModeOverrides = settings.value(SER_SDSHOSTLOSSLESSOVERRIDES, QVariantMap()).toMap();
 
 
     // Perform default settings updates as required based on last default version
@@ -435,6 +459,13 @@ void StreamingPreferences::save()
     settings.setValue(SER_HOSTPLAYAUDIO, hostPlayAudioOverrides);
     settings.setValue(SER_SDSMATCHHOSTRES, matchHostResolution);
     settings.setValue(SER_SDSREVERTHOSTRES, revertHostResolution);
+
+    // secure-desktop-stream: true bit-exact SDLL v1 lossless video mode
+    settings.setValue(SER_SDSLOSSLESSMODE, enableLosslessMode);
+    settings.setValue(SER_SDSLOSSLESSDECODER, static_cast<int>(losslessDecoderMode));
+    settings.setValue(SER_SDSLOSSLESSHASH, static_cast<int>(losslessHashMode));
+    settings.setValue(SER_SDSLOSSLESSHOSTENC, static_cast<int>(losslessHostEncoderMode));
+    settings.setValue(SER_SDSHOSTLOSSLESSOVERRIDES, hostLosslessModeOverrides);
 }
 
 namespace {
@@ -703,7 +734,25 @@ bool StreamingPreferences::clearHostOverrides(const QString& fingerprint)
     removeMapEntry(hostGameOptimizationsOverrides, [this]() { emit hostGameOptimizationsOverridesChanged(); });
     removeMapEntry(hostQuitAppAfterOverrides, [this]() { emit hostQuitAppAfterOverridesChanged(); });
     removeMapEntry(hostPlayAudioOverrides, [this]() { emit hostPlayAudioOverridesChanged(); });
+    removeMapEntry(hostLosslessModeOverrides, [this]() { emit hostLosslessModeOverridesChanged(); });
     return changed;
+}
+
+int StreamingPreferences::losslessModeOverrideState(const QString& fingerprint) const
+{
+    return lookupBoolOverrideState(hostLosslessModeOverrides, fingerprint);
+}
+
+void StreamingPreferences::setLosslessModeOverride(const QString& fingerprint, int state)
+{
+    if (updateBoolOverrideState(hostLosslessModeOverrides, fingerprint, state)) {
+        emit hostLosslessModeOverridesChanged();
+    }
+}
+
+bool StreamingPreferences::losslessModeForHost(const QString& fingerprint) const
+{
+    return resolveBoolOverride(hostLosslessModeOverrides, fingerprint, enableLosslessMode);
 }
 
 void StreamingPreferences::requestMicrophonePermission()

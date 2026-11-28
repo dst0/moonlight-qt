@@ -4,6 +4,9 @@
 #include "SDL_compat.h"
 #include "settings/streamingpreferences.h"
 
+#include <QSslCertificate>
+#include <QSslKey>
+#include <QString>
 #include <memory>
 
 class AdaptiveTileInbox;
@@ -54,6 +57,16 @@ typedef struct _DECODER_PARAMETERS {
     int logicalHeight = 0;
     bool adaptiveTileRefinement = false;
     std::shared_ptr<AdaptiveTileInbox> refinementInbox;
+
+    // secure-desktop-stream: true bit-exact SDLL v1 lossless video mode
+    bool losslessMode = false;
+    StreamingPreferences::LosslessDecoderMode losslessDecoderMode = StreamingPreferences::LDM_AUTO;
+    StreamingPreferences::LosslessHashMode losslessHashMode = StreamingPreferences::LHM_CRC32C;
+    QString losslessHostAddress;
+    quint16 losslessHttpsPort = 0;
+    QSslCertificate losslessServerCert = QSslCertificate();
+    QSslCertificate losslessClientCert = QSslCertificate();
+    QSslKey losslessClientKey = QSslKey();
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
 
 #define WINDOW_STATE_CHANGE_SIZE 0x01

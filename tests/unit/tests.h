@@ -12,8 +12,10 @@ int runBoxArtTests(int argc, char** argv);
 int runPreferencesTests(int argc, char** argv);
 int runPacked444Tests(int argc, char** argv);
 int runAdaptiveRefinementTests(int argc, char** argv);
+int runLosslessCodecTests(int argc, char** argv);
 #ifdef Q_OS_DARWIN
 int runKeychainTests(int argc, char** argv);
 int runMetalYCoCgRTests(int argc, char** argv);
 int runMetalRefinementTests(int argc, char** argv);
+int runMetalLosslessTests(int argc, char** argv);
 #endif

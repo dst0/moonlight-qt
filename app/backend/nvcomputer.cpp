@@ -250,6 +250,7 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
     this->sdsVersion = qMax(0, NvHTTP::getXmlString(serverInfo, "sdsVersion").toInt());
     this->sdsFeatures.clear();
     this->sdsEncoders.clear();
+    this->sdsLosslessBackends.clear();
     this->sdsSoftwareCodecModeSupport = 0;
     this->sdsAdapters.clear();
     if (this->sdsVersion > 0) {
@@ -259,7 +260,7 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
             if ((f == "clipboard" || f == "files" || f == "mic" || f == "file_clipboard" ||
                  f == "host_encoder" || f == "host_capture_adapter" || f == "host_resolution" ||
                  f == "lazy_clipboard" || f == "xdnd_drop" || f == "hw_ycocgr_444" ||
-                 f == "adaptive_tile_refinement") &&
+                 f == "adaptive_tile_refinement" || f == "lossless_video") &&
                 !this->sdsFeatures.contains(f)) {
                 this->sdsFeatures.append(f);
             }
@@ -270,6 +271,14 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
             QString e = enc.trimmed().toLower();
             if (!e.isEmpty() && !this->sdsEncoders.contains(e)) {
                 this->sdsEncoders.append(e);
+            }
+        }
+
+        const QStringList backends = NvHTTP::getXmlString(serverInfo, "sdsLosslessBackends").split(',', Qt::SkipEmptyParts);
+        for (const QString& b : backends) {
+            QString bn = b.trimmed().toLower();
+            if (!bn.isEmpty() && !this->sdsLosslessBackends.contains(bn)) {
+                this->sdsLosslessBackends.append(bn);
             }
         }
 
@@ -701,6 +710,7 @@ bool NvComputer::update(const NvComputer& that)
     ASSIGN_IF_CHANGED(sdsVersion);
     ASSIGN_IF_CHANGED(sdsFeatures);
     ASSIGN_IF_CHANGED(sdsEncoders);
+    ASSIGN_IF_CHANGED(sdsLosslessBackends);
     ASSIGN_IF_CHANGED(sdsSoftwareCodecModeSupport);
     ASSIGN_IF_CHANGED(sdsAdapters);
     ASSIGN_IF_CHANGED(maxPackedWidth);

@@ -442,6 +442,8 @@ CenteredGridView {
         property int muteHostSpeakersOverride: -1
         property int gameOptimizationsOverride: -1
         property int quitAppAfterOverride: -1
+        property int losslessModeOverride: -1
+        property bool supportsLosslessVideo: false
         property int openGeneration: 0
 
         readonly property bool effectiveMatchHostRes: matchHostResolutionOverride < 0
@@ -497,6 +499,8 @@ CenteredGridView {
             muteHostSpeakersOverride = cfg.muteHostSpeakersOverride !== undefined ? cfg.muteHostSpeakersOverride : -1
             gameOptimizationsOverride = cfg.gameOptimizationsOverride !== undefined ? cfg.gameOptimizationsOverride : -1
             quitAppAfterOverride = cfg.quitAppAfterOverride !== undefined ? cfg.quitAppAfterOverride : -1
+            supportsLosslessVideo = !!cfg.supportsLosslessVideo
+            losslessModeOverride = cfg.losslessModeOverride !== undefined ? cfg.losslessModeOverride : -1
 
             pcSettingsFlickable.contentY = 0
             openGeneration += 1
@@ -554,6 +558,7 @@ CenteredGridView {
             case "muteHostSpeakers": return !StreamingPreferences.playAudioOnHost
             case "gameOptimizations": return StreamingPreferences.gameOptimizations
             case "quitAppAfter": return StreamingPreferences.quitAppAfter
+            case "losslessMode": return StreamingPreferences.enableLosslessMode
             default: return false
             }
         }
@@ -565,6 +570,7 @@ CenteredGridView {
             case "muteHostSpeakers": return muteHostSpeakersOverride
             case "gameOptimizations": return gameOptimizationsOverride
             case "quitAppAfter": return quitAppAfterOverride
+            case "losslessMode": return losslessModeOverride
             default: return -1
             }
         }
@@ -585,6 +591,9 @@ CenteredGridView {
                 break
             case "quitAppAfter":
                 quitAppAfterOverride = state
+                break
+            case "losslessMode":
+                losslessModeOverride = state
                 break
             }
         }
@@ -608,6 +617,8 @@ CenteredGridView {
                 return qsTr("Lets the host apply optimized game or session display settings for streaming.")
             case "quitAppAfter":
                 return qsTr("This will close the app or game you are streaming when you end your stream. You will lose any unsaved progress!")
+            case "losslessMode":
+                return qsTr("Overrides the global bit-exact RGB24 lossless mode (SDLL v1) setting for this PC.")
             default:
                 return ""
             }
@@ -622,7 +633,8 @@ CenteredGridView {
                     "revertHostResolutionOverride": revertHostResolutionOverride,
                     "muteHostSpeakersOverride": muteHostSpeakersOverride,
                     "gameOptimizationsOverride": gameOptimizationsOverride,
-                    "quitAppAfterOverride": quitAppAfterOverride
+                    "quitAppAfterOverride": quitAppAfterOverride,
+                    "losslessModeOverride": losslessModeOverride
                 }
                 if (hasMultipleAdapters) {
                     payload["selectedAdapterId"] = selectedAdapterId
@@ -952,6 +964,7 @@ CenteredGridView {
 
                     Repeater {
                         model: [
+                            { key: "losslessMode", label: qsTr("Bit-exact lossless streaming (RGB24)") },
                             { key: "matchHostResolution", label: qsTr("Match host resolution while streaming") },
                             { key: "revertHostResolution", label: qsTr("Revert host resolution when stream ends") },
                             { key: "muteHostSpeakers", label: qsTr("Mute host PC speakers while streaming") },

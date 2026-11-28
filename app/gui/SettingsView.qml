@@ -923,6 +923,147 @@ Flickable {
         }
 
         SettingsGroupBox {
+            id: losslessSettingsGroupBox
+            width: (parent.width - (parent.leftPadding + parent.rightPadding))
+            title: qsTr("Bit-Exact Lossless Mode (SDS)")
+            font.pointSize: 12
+
+            Column {
+                anchors.fill: parent
+                spacing: 6
+
+                CheckBox {
+                    id: enableLosslessModeCheck
+                    width: parent.width
+                    text: qsTr("Enable bit-exact RGB24 lossless streaming (SDLL v1)")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.enableLosslessMode
+                    onCheckedChanged: {
+                        StreamingPreferences.enableLosslessMode = checked
+                    }
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 6000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Streams pixel-for-pixel exact 8-bit RGB24 frames with per-frame hash verification (bypasses HDR and lossy codecs). Best over wired LAN.")
+                }
+
+                RowLayout {
+                    width: parent.width
+                    spacing: 10
+                    enabled: enableLosslessModeCheck.checked
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: qsTr("Client lossless decoder & renderer")
+                        font.pointSize: 11
+                        wrapMode: Text.Wrap
+                    }
+
+                    AutoResizingComboBox {
+                        id: losslessDecoderCombo
+                        model: ListModel {
+                            id: losslessDecoderListModel
+                            ListElement { text: qsTr("Automatic (GPU Compute / CPU)"); val: StreamingPreferences.LDM_AUTO }
+                            ListElement { text: qsTr("GPU Compute (Metal / D3D11 / Vulkan)"); val: StreamingPreferences.LDM_GPU }
+                            ListElement { text: qsTr("CPU SIMD (Software + SDL/Native)"); val: StreamingPreferences.LDM_CPU }
+                        }
+                        textRole: "text"
+                        Component.onCompleted: {
+                            var saved = StreamingPreferences.losslessDecoderMode
+                            currentIndex = 0
+                            for (var i = 0; i < losslessDecoderListModel.count; i++) {
+                                if (losslessDecoderListModel.get(i).val === saved) {
+                                    currentIndex = i
+                                    break
+                                }
+                            }
+                            recalculateWidth()
+                        }
+                        onActivated: {
+                            StreamingPreferences.losslessDecoderMode = losslessDecoderListModel.get(currentIndex).val
+                        }
+                    }
+                }
+
+                RowLayout {
+                    width: parent.width
+                    spacing: 10
+                    enabled: enableLosslessModeCheck.checked
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: qsTr("Per-frame bit-exact hash verification")
+                        font.pointSize: 11
+                        wrapMode: Text.Wrap
+                    }
+
+                    AutoResizingComboBox {
+                        id: losslessHashCombo
+                        model: ListModel {
+                            id: losslessHashListModel
+                            ListElement { text: qsTr("CRC32C (Hardware Accelerated)"); val: StreamingPreferences.LHM_CRC32C }
+                            ListElement { text: qsTr("BLAKE3-256 (Cryptographic)"); val: StreamingPreferences.LHM_BLAKE3 }
+                            ListElement { text: qsTr("Off"); val: StreamingPreferences.LHM_OFF }
+                        }
+                        textRole: "text"
+                        Component.onCompleted: {
+                            var saved = StreamingPreferences.losslessHashMode
+                            currentIndex = 0
+                            for (var i = 0; i < losslessHashListModel.count; i++) {
+                                if (losslessHashListModel.get(i).val === saved) {
+                                    currentIndex = i
+                                    break
+                                }
+                            }
+                            recalculateWidth()
+                        }
+                        onActivated: {
+                            StreamingPreferences.losslessHashMode = losslessHashListModel.get(currentIndex).val
+                        }
+                    }
+                }
+
+                RowLayout {
+                    width: parent.width
+                    spacing: 10
+                    enabled: enableLosslessModeCheck.checked
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: qsTr("Host lossless encoder")
+                        font.pointSize: 11
+                        wrapMode: Text.Wrap
+                    }
+
+                    AutoResizingComboBox {
+                        id: losslessHostEncCombo
+                        model: ListModel {
+                            id: losslessHostEncListModel
+                            ListElement { text: qsTr("Automatic (GPU Compute / CPU)"); val: StreamingPreferences.LHEM_AUTO }
+                            ListElement { text: qsTr("GPU Compute"); val: StreamingPreferences.LHEM_GPU }
+                            ListElement { text: qsTr("CPU SIMD"); val: StreamingPreferences.LHEM_CPU }
+                        }
+                        textRole: "text"
+                        Component.onCompleted: {
+                            var saved = StreamingPreferences.losslessHostEncoderMode
+                            currentIndex = 0
+                            for (var i = 0; i < losslessHostEncListModel.count; i++) {
+                                if (losslessHostEncListModel.get(i).val === saved) {
+                                    currentIndex = i
+                                    break
+                                }
+                            }
+                            recalculateWidth()
+                        }
+                        onActivated: {
+                            StreamingPreferences.losslessHostEncoderMode = losslessHostEncListModel.get(currentIndex).val
+                        }
+                    }
+                }
+            }
+        }
+
+        SettingsGroupBox {
 
             id: audioSettingsGroupBox
             width: (parent.width - (parent.leftPadding + parent.rightPadding))

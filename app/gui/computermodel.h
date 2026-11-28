@@ -25,7 +25,8 @@ class ComputerModel : public QAbstractListModel
         SelectedCaptureAdapterIdRole,
         SupportsAdaptiveTileRefinementRole,
         AdaptiveTileRefinementEnabledRole,
-        SupportsHostEncoderRole
+        SupportsHostEncoderRole,
+        SupportsLosslessVideoRole
     };
 
 public:

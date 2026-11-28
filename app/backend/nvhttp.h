@@ -173,7 +173,10 @@ public:
              QString& rtspSessionUrl,
              const QString& sdsChromaMode = QString(),
              QString extraQueryParams = QString(),
-             bool sdsTileRefinement = false);
+             bool sdsTileRefinement = false,
+             bool sdsLosslessMode = false,
+             const QString& sdsLosslessHash = QString(),
+             const QString& sdsLosslessEncoder = QString());
 
     QVector<NvApp>
     getAppList();

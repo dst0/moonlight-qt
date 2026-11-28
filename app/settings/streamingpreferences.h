@@ -56,6 +56,31 @@ public:
     };
     Q_ENUM(HostEncoderConfig)
 
+    // secure-desktop-stream: true bit-exact SDLL v1 lossless video mode
+    enum LosslessDecoderMode
+    {
+        LDM_AUTO,
+        LDM_GPU,
+        LDM_CPU
+    };
+    Q_ENUM(LosslessDecoderMode)
+
+    enum LosslessHashMode
+    {
+        LHM_CRC32C,
+        LHM_BLAKE3,
+        LHM_OFF
+    };
+    Q_ENUM(LosslessHashMode)
+
+    enum LosslessHostEncoderMode
+    {
+        LHEM_AUTO,
+        LHEM_GPU,
+        LHEM_CPU
+    };
+    Q_ENUM(LosslessHostEncoderMode)
+
     // Mac only (for now)
     enum RendererSelection
     {
@@ -193,6 +218,13 @@ public:
     Q_PROPERTY(bool matchHostResolution MEMBER matchHostResolution NOTIFY matchHostResolutionChanged)
     Q_PROPERTY(bool revertHostResolution MEMBER revertHostResolution NOTIFY revertHostResolutionChanged)
 
+    // secure-desktop-stream: true bit-exact SDLL v1 lossless video mode
+    Q_PROPERTY(bool enableLosslessMode MEMBER enableLosslessMode NOTIFY enableLosslessModeChanged)
+    Q_PROPERTY(LosslessDecoderMode losslessDecoderMode MEMBER losslessDecoderMode NOTIFY losslessDecoderModeChanged)
+    Q_PROPERTY(LosslessHashMode losslessHashMode MEMBER losslessHashMode NOTIFY losslessHashModeChanged)
+    Q_PROPERTY(LosslessHostEncoderMode losslessHostEncoderMode MEMBER losslessHostEncoderMode NOTIFY losslessHostEncoderModeChanged)
+    Q_PROPERTY(QVariantMap hostLosslessModeOverrides MEMBER hostLosslessModeOverrides NOTIFY hostLosslessModeOverridesChanged)
+
     Q_INVOKABLE bool retranslate();
     Q_INVOKABLE HostEncoderConfig hostEncoderForHost(const QString& fingerprint) const;
     Q_INVOKABLE void setHostEncoderForHost(const QString& fingerprint, HostEncoderConfig config);
@@ -219,6 +251,33 @@ public:
     Q_INVOKABLE int playAudioOnHostOverrideState(const QString& fingerprint) const;
     Q_INVOKABLE void setPlayAudioOnHostOverride(const QString& fingerprint, int state);
     Q_INVOKABLE bool playAudioOnHostForHost(const QString& fingerprint) const;
+    Q_INVOKABLE int losslessModeOverrideState(const QString& fingerprint) const;
+    Q_INVOKABLE void setLosslessModeOverride(const QString& fingerprint, int state);
+    Q_INVOKABLE bool losslessModeForHost(const QString& fingerprint) const;
+    Q_INVOKABLE static QString losslessHashQueryValue(LosslessHashMode mode)
+    {
+        switch (mode) {
+        case LHM_BLAKE3:
+            return QStringLiteral("blake3");
+        case LHM_OFF:
+            return QStringLiteral("off");
+        case LHM_CRC32C:
+        default:
+            return QStringLiteral("crc32c");
+        }
+    }
+    Q_INVOKABLE static QString losslessHostEncoderQueryValue(LosslessHostEncoderMode mode)
+    {
+        switch (mode) {
+        case LHEM_GPU:
+            return QStringLiteral("gpu");
+        case LHEM_CPU:
+            return QStringLiteral("cpu");
+        case LHEM_AUTO:
+        default:
+            return QStringLiteral("auto");
+        }
+    }
     Q_INVOKABLE bool clearHostOverrides(const QString& fingerprint);
     Q_INVOKABLE static QString hostEncoderQueryValue(HostEncoderConfig config)
     {
@@ -305,6 +364,13 @@ public:
     bool matchHostResolution;
     bool revertHostResolution;
 
+    // secure-desktop-stream: true bit-exact SDLL v1 lossless video mode
+    bool enableLosslessMode;
+    LosslessDecoderMode losslessDecoderMode;
+    LosslessHashMode losslessHashMode;
+    LosslessHostEncoderMode losslessHostEncoderMode;
+    QVariantMap hostLosslessModeOverrides;
+
 signals:
     void displayModeChanged();
     void bitrateChanged();
@@ -364,6 +430,11 @@ signals:
     void hostPlayAudioOverridesChanged();
     void matchHostResolutionChanged();
     void revertHostResolutionChanged();
+    void enableLosslessModeChanged();
+    void losslessDecoderModeChanged();
+    void losslessHashModeChanged();
+    void losslessHostEncoderModeChanged();
+    void hostLosslessModeOverridesChanged();
 
 private:
     explicit StreamingPreferences(QQmlEngine *qmlEngine);

@@ -16,6 +16,7 @@
 #ifdef HAVE_FFMPEG
 #include "video/ffmpeg.h"
 #endif
+#include "video/lossless_decoder.h"
 
 #ifdef Q_OS_DARWIN
 #include "video/ffmpeg-renderers/vt.h"
@@ -288,7 +289,15 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             int frameRate, bool enableVsync, bool enableFramePacing, bool testOnly, IVideoDecoder*& chosenDecoder,
                             int packedYCoCgRMode, int logicalWidth, int logicalHeight,
                             bool adaptiveTileRefinement,
-                            std::shared_ptr<AdaptiveTileInbox> refinementInbox)
+                            std::shared_ptr<AdaptiveTileInbox> refinementInbox,
+                            bool losslessMode,
+                            StreamingPreferences::LosslessDecoderMode losslessDecoderMode,
+                            StreamingPreferences::LosslessHashMode losslessHashMode,
+                            const QString& losslessHostAddress,
+                            quint16 losslessHttpsPort,
+                            const QSslCertificate& losslessServerCert,
+                            const QSslCertificate& losslessClientCert,
+                            const QSslKey& losslessClientKey)
 {
     DECODER_PARAMETERS params{};
 
@@ -312,10 +321,32 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.logicalHeight = logicalHeight;
     params.adaptiveTileRefinement = adaptiveTileRefinement;
     params.refinementInbox = std::move(refinementInbox);
+    params.losslessMode = losslessMode;
+    params.losslessDecoderMode = losslessDecoderMode;
+    params.losslessHashMode = losslessHashMode;
+    params.losslessHostAddress = losslessHostAddress;
+    params.losslessHttpsPort = losslessHttpsPort;
+    params.losslessServerCert = losslessServerCert;
+    params.losslessClientCert = losslessClientCert;
+    params.losslessClientKey = losslessClientKey;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "V-sync %s",
                 enableVsync ? "enabled" : "disabled");
+
+    if (params.losslessMode) {
+        chosenDecoder = new LosslessVideoDecoder();
+        if (chosenDecoder->initialize(&params)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "LosslessVideoDecoder chosen (SDLL v1)");
+            return true;
+        }
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Unable to load LosslessVideoDecoder");
+        delete chosenDecoder;
+        chosenDecoder = nullptr;
+        return false;
+    }
 
 #ifdef HAVE_SLVIDEO
     chosenDecoder = new SLVideoDecoder(testOnly);
@@ -551,7 +582,16 @@ bool Session::populateDecoderProperties(SDL_Window* window)
                        m_UsePackedYCoCgRA1 ? 1 : 0,
                        m_StreamConfig.width,
                        m_StreamConfig.height,
-                       m_AdaptiveRefinementActive)) {
+                       m_AdaptiveRefinementActive,
+                       {},
+                       m_LosslessModeActive,
+                       m_Preferences->losslessDecoderMode,
+                       m_Preferences->losslessHashMode,
+                       m_LosslessHostAddress,
+                       m_LosslessHttpsPort,
+                       m_LosslessServerCert,
+                       m_LosslessClientCert,
+                       m_LosslessClientKey)) {
         return false;
     }
 
@@ -619,6 +659,8 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_UsePackedYCoCgRA1(false),
       m_AdaptiveRefinementDecision{},
       m_AdaptiveRefinementActive(false),
+      m_LosslessModeActive(false),
+      m_LosslessHttpsPort(0),
       m_OpusDecoder(nullptr),
       m_AudioRenderer(nullptr),
       m_AudioSampleCount(0),
@@ -770,13 +812,19 @@ bool Session::initialize(QQuickWindow* qtWindow)
                 "Audio channel mask: %X",
                 CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(m_StreamConfig.audioConfiguration));
 
-    // Evaluate adaptive dirty-tile refinement & hardware packed YCoCg-R P010 4:4:4 eligibility
+    // Evaluate adaptive dirty-tile refinement & hardware packed YCoCg-R P010 4:4:4 & SDLL v1 lossless eligibility
     m_UsePackedYCoCgRA1 = false;
     m_Packed444Layout = {};
     m_Packed444Decision = {};
     m_AdaptiveRefinementActive = false;
     m_AdaptiveRefinementDecision = {};
     m_RefinementInbox.reset();
+    m_LosslessModeActive = false;
+    m_LosslessHostAddress.clear();
+    m_LosslessHttpsPort = 0;
+    m_LosslessServerCert.clear();
+    m_LosslessClientCert.clear();
+    m_LosslessClientKey.clear();
     {
         bool isNvidiaServerSoftware = false;
         bool hasHostEncoder = false;
@@ -789,6 +837,9 @@ bool Session::initialize(QQuickWindow* qtWindow)
         int maxPackedHeight = 0;
         QString gpuModel;
         QString certFingerprint;
+        NvAddress initAddr;
+        uint16_t initHttpsPort = 0;
+        QSslCertificate initServerCert;
         {
             QReadLocker lock(&m_Computer->lock);
             isNvidiaServerSoftware = m_Computer->isNvidiaServerSoftware;
@@ -802,6 +853,25 @@ bool Session::initialize(QQuickWindow* qtWindow)
             maxPackedHeight = m_Computer->maxPackedHeight;
             gpuModel = m_Computer->gpuModel;
             certFingerprint = SdsLaunch::hostCertFingerprint(m_Computer->serverCert);
+            initAddr = m_Computer->activeAddress;
+            initHttpsPort = m_Computer->activeHttpsPort;
+            initServerCert = m_Computer->serverCert;
+        }
+
+        const bool wantLossless = !certFingerprint.isEmpty() ? m_Preferences->losslessModeForHost(certFingerprint) : m_Preferences->enableLosslessMode;
+        const bool hostSupportsLossless = !isNvidiaServerSoftware && (sdsVersion > 0) && sdsFeatures.contains(QStringLiteral("lossless_video"));
+        if (wantLossless && !hostSupportsLossless) {
+            emitLaunchWarning(tr("Bit-exact lossless streaming is not supported by this host; using standard streaming."));
+        }
+        m_LosslessModeActive = wantLossless && hostSupportsLossless;
+        if (m_LosslessModeActive) {
+            m_StreamConfig.sdsLosslessVideo = true;
+            m_LosslessHostAddress = initAddr.address();
+            m_LosslessHttpsPort = initHttpsPort != 0 ? initHttpsPort : DEFAULT_HTTPS_PORT;
+            m_LosslessServerCert = initServerCert;
+            const QSslConfiguration idCfg = IdentityManager::get()->getSslConfig();
+            m_LosslessClientCert = idCfg.localCertificate();
+            m_LosslessClientKey = idCfg.privateKey();
         }
 
         const bool metalAvailable =
@@ -812,10 +882,10 @@ bool Session::initialize(QQuickWindow* qtWindow)
 #endif
 
         AdaptiveRefinementInputs refInputs;
-        refInputs.hostToggleEnabled = !certFingerprint.isEmpty() && m_Preferences->adaptiveRefinementForHost(certFingerprint);
+        refInputs.hostToggleEnabled = !m_LosslessModeActive && !certFingerprint.isEmpty() && m_Preferences->adaptiveRefinementForHost(certFingerprint);
         refInputs.hostSupportsTileRefinement = (sdsVersion > 0) && sdsFeatures.contains(QStringLiteral("adaptive_tile_refinement"));
-        refInputs.enableHdr = m_Preferences->enableHdr;
-        refInputs.enableYUV444 = m_Preferences->enableYUV444;
+        refInputs.enableHdr = !m_LosslessModeActive && m_Preferences->enableHdr;
+        refInputs.enableYUV444 = !m_LosslessModeActive && m_Preferences->enableYUV444;
         refInputs.rendererSelection = m_Preferences->rendererSelection;
 #ifdef Q_OS_DARWIN
         refInputs.isMacOS = true;
@@ -825,8 +895,8 @@ bool Session::initialize(QQuickWindow* qtWindow)
         refInputs.isMetalAvailable = metalAvailable;
 
         m_AdaptiveRefinementDecision = resolveAdaptiveRefinementDecision(refInputs);
-        m_AdaptiveRefinementActive = m_AdaptiveRefinementDecision.active;
-        if (!m_AdaptiveRefinementDecision.statusNote.isEmpty() && refInputs.hostToggleEnabled) {
+        m_AdaptiveRefinementActive = !m_LosslessModeActive && m_AdaptiveRefinementDecision.active;
+        if (!m_LosslessModeActive && !m_AdaptiveRefinementDecision.statusNote.isEmpty() && refInputs.hostToggleEnabled) {
             emitLaunchWarning(m_AdaptiveRefinementDecision.statusNote);
         }
         if (m_AdaptiveRefinementActive) {
@@ -843,7 +913,7 @@ bool Session::initialize(QQuickWindow* qtWindow)
                     hostEncoderConfig);
 
         Packed444Inputs packedInputs;
-        packedInputs.enableYUV444 = m_Preferences->enableYUV444 && !m_AdaptiveRefinementDecision.suppressPackedYCoCgR;
+        packedInputs.enableYUV444 = !m_LosslessModeActive && m_Preferences->enableYUV444 && !m_AdaptiveRefinementActive;
         packedInputs.enableHdr = m_Preferences->enableHdr;
         packedInputs.videoCodecConfig = m_Preferences->videoCodecConfig;
         packedInputs.videoDecoderSelection = m_Preferences->videoDecoderSelection;
@@ -907,7 +977,11 @@ bool Session::initialize(QQuickWindow* qtWindow)
         }
     }
 
-    if (m_UsePackedYCoCgRA1) {
+    if (m_LosslessModeActive) {
+        m_SupportedVideoFormats.clear();
+        m_SupportedVideoFormats.append(VIDEO_FORMAT_H264);
+    }
+    else if (m_UsePackedYCoCgRA1) {
         // Negotiate 10-bit HEVC 4:2:0 Main10 (without YUV444 mask) while keeping 4:4:4 bitrate
         m_SupportedVideoFormats.clear();
         m_SupportedVideoFormats.append(VIDEO_FORMAT_H265_MAIN10);
@@ -1321,7 +1395,7 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         }
     }
 
-    if (m_Preferences->enableHdr) {
+    if (!m_LosslessModeActive && m_Preferences->enableHdr) {
         if (m_Preferences->videoCodecConfig == StreamingPreferences::VCC_FORCE_H264) {
             emitLaunchWarning(tr("HDR is not supported using the H.264 codec."));
             m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_10BIT);
@@ -1945,6 +2019,12 @@ bool Session::startConnectionAsync()
 
     QString rtspSessionUrl;
 
+    if (m_LosslessModeActive) {
+        m_LosslessHostAddress = activeAddress.address();
+        m_LosslessHttpsPort = activeHttpsPort != 0 ? activeHttpsPort : DEFAULT_HTTPS_PORT;
+        m_LosslessServerCert = serverCert;
+    }
+
     try {
         NvHTTP http(activeAddress, activeHttpsPort, serverCert, !isNvidiaServerSoftware);
         http.startApp(currentGameId != 0 ? "resume" : "launch",
@@ -1957,7 +2037,10 @@ bool Session::startConnectionAsync()
                       rtspSessionUrl,
                       m_UsePackedYCoCgRA1 ? QStringLiteral("ycocgr_p010_a1") : QString(),
                       extraQueryParams,
-                      m_AdaptiveRefinementActive);
+                      m_AdaptiveRefinementActive,
+                      m_LosslessModeActive,
+                      m_LosslessModeActive ? StreamingPreferences::losslessHashQueryValue(m_Preferences->losslessHashMode) : QString(),
+                      m_LosslessModeActive ? StreamingPreferences::losslessHostEncoderQueryValue(m_Preferences->losslessHostEncoderMode) : QString());
     } catch (const GfeHttpResponseException& e) {
         clearStreamSecrets();
         emit displayLaunchError(tr("Host returned error: %1").arg(e.toQString()));
@@ -2670,7 +2753,15 @@ void Session::exec()
                                    m_ActiveVideoWidth,
                                    m_ActiveVideoHeight,
                                    s_ActiveSession->m_AdaptiveRefinementActive,
-                                   s_ActiveSession->m_RefinementInbox)) {
+                                   s_ActiveSession->m_RefinementInbox,
+                                   s_ActiveSession->m_LosslessModeActive,
+                                   m_Preferences->losslessDecoderMode,
+                                   m_Preferences->losslessHashMode,
+                                   s_ActiveSession->m_LosslessHostAddress,
+                                   s_ActiveSession->m_LosslessHttpsPort,
+                                   s_ActiveSession->m_LosslessServerCert,
+                                   s_ActiveSession->m_LosslessClientCert,
+                                   s_ActiveSession->m_LosslessClientKey)) {
                     SDL_UnlockMutex(m_DecoderLock);
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                                  "Failed to recreate decoder after reset");

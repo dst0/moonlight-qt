@@ -126,6 +126,7 @@ public:
     int sdsVersion = 0;
     QStringList sdsFeatures;
     QStringList sdsEncoders;
+    QStringList sdsLosslessBackends;
     int sdsSoftwareCodecModeSupport = 0;
     QVector<NvHostAdapter> sdsAdapters;
     int maxPackedWidth = 0;

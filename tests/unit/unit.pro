@@ -32,6 +32,7 @@ SOURCES += \
     tst_nvhttp.cpp \
     tst_preferences.cpp \
     test_adaptiverefinement.cpp \
+    test_lossless_codec.cpp \
     test_packed444.cpp \
     $$APP_DIR/backend/boxartmanager.cpp \
     $$APP_DIR/backend/nvcomputer.cpp \
@@ -47,6 +48,9 @@ SOURCES += \
     $$APP_DIR/streaming/bandwidth.cpp \
     $$APP_DIR/streaming/video/adaptiverefinement.cpp \
     $$APP_DIR/streaming/video/adaptiverefinement_codec.cpp \
+    $$APP_DIR/streaming/video/lossless_client.cpp \
+    $$APP_DIR/streaming/video/lossless_codec.cpp \
+    $$APP_DIR/streaming/video/lossless_hash.cpp \
     $$APP_DIR/streaming/video/packed444.cpp
 
 HEADERS += \
@@ -57,14 +61,19 @@ HEADERS += \
     $$APP_DIR/streaming/bandwidth.h \
     $$APP_DIR/streaming/video/adaptiverefinement.h \
     $$APP_DIR/streaming/video/adaptiverefinement_codec.h \
+    $$APP_DIR/streaming/video/lossless_client.h \
+    $$APP_DIR/streaming/video/lossless_codec.h \
+    $$APP_DIR/streaming/video/lossless_hash.h \
     $$APP_DIR/streaming/video/packed444.h
 
 macx {
     HEADERS += \
+        test_metal_lossless.h \
         test_metal_refinement.h \
         test_metal_ycocgr.h
     SOURCES += \
         tst_keychain.cpp \
+        test_metal_lossless.mm \
         test_metal_refinement.mm \
         test_metal_ycocgr.mm \
         $$APP_DIR/backend/keychain_mac.cpp

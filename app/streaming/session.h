@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QSemaphore>
+#include <QSslCertificate>
+#include <QSslKey>
 #include <QQuickWindow>
 
 #include <Limelight.h>
@@ -206,7 +208,15 @@ private:
                        int logicalWidth = 0,
                        int logicalHeight = 0,
                        bool adaptiveTileRefinement = false,
-                       std::shared_ptr<AdaptiveTileInbox> refinementInbox = {});
+                       std::shared_ptr<AdaptiveTileInbox> refinementInbox = {},
+                       bool losslessMode = false,
+                       StreamingPreferences::LosslessDecoderMode losslessDecoderMode = StreamingPreferences::LDM_AUTO,
+                       StreamingPreferences::LosslessHashMode losslessHashMode = StreamingPreferences::LHM_CRC32C,
+                       const QString& losslessHostAddress = QString(),
+                       quint16 losslessHttpsPort = 0,
+                       const QSslCertificate& losslessServerCert = QSslCertificate(),
+                       const QSslCertificate& losslessClientCert = QSslCertificate(),
+                       const QSslKey& losslessClientKey = QSslKey());
 
     static
     void clStageStarting(int stage);
@@ -296,6 +306,14 @@ private:
     AdaptiveRefinementDecision m_AdaptiveRefinementDecision;
     bool m_AdaptiveRefinementActive;
     std::shared_ptr<AdaptiveTileInbox> m_RefinementInbox;
+
+    // secure-desktop-stream: true bit-exact SDLL v1 lossless video mode
+    bool m_LosslessModeActive;
+    QString m_LosslessHostAddress;
+    quint16 m_LosslessHttpsPort;
+    QSslCertificate m_LosslessServerCert;
+    QSslCertificate m_LosslessClientCert;
+    QSslKey m_LosslessClientKey;
 
     OpusMSDecoder* m_OpusDecoder;
     IAudioRenderer* m_AudioRenderer;

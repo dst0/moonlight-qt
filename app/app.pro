@@ -150,7 +150,7 @@ unix:if(!macx|disable-prebuilts) {
     }
 }
 win32 {
-    LIBS += -llibssl -llibcrypto -lSDL2 -lSDL2_ttf -lavcodec -lavutil -lswscale -lopus -ldxgi -ld3d11 -llibplacebo
+    LIBS += -llibssl -llibcrypto -lSDL2 -lSDL2_ttf -lavcodec -lavutil -lswscale -lopus -ldxgi -ld3d11 -ld3dcompiler -llibplacebo
     CONFIG += ffmpeg libplacebo
 }
 macx {
@@ -287,6 +287,32 @@ macx {
     HEADERS += streaming/audio/miccapture_format_mac.h
 } else {
     SOURCES += streaming/audio/miccapture_none.cpp
+}
+
+# secure-desktop-stream: true bit-exact SDLL v1 lossless video mode
+SOURCES += \
+    streaming/video/lossless_client.cpp \
+    streaming/video/lossless_codec.cpp \
+    streaming/video/lossless_decoder.cpp \
+    streaming/video/lossless_hash.cpp \
+    streaming/video/lossless_sdl.cpp
+HEADERS += \
+    streaming/video/lossless_client.h \
+    streaming/video/lossless_codec.h \
+    streaming/video/lossless_decoder.h \
+    streaming/video/lossless_hash.h \
+    streaming/video/lossless_renderer.h \
+    streaming/video/lossless_sdl.h
+macx {
+    SOURCES += streaming/video/lossless_metal.mm
+    HEADERS += streaming/video/lossless_metal.h
+} else:win32:!winrt {
+    SOURCES += streaming/video/lossless_d3d11.cpp
+    HEADERS += streaming/video/lossless_d3d11.h
+} else:unix:!macx:!android {
+    SOURCES += streaming/video/lossless_vulkan.cpp
+    HEADERS += streaming/video/lossless_vulkan.h
+    LIBS += -ldl
 }
 
 # Platform-specific renderers and decoders

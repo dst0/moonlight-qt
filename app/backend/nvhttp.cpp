@@ -214,7 +214,10 @@ NvHTTP::startApp(QString verb,
                  QString& rtspSessionUrl,
                  const QString& sdsChromaMode,
                  QString extraQueryParams,
-                 bool sdsTileRefinement)
+                 bool sdsTileRefinement,
+                 bool sdsLosslessMode,
+                 const QString& sdsLosslessHash,
+                 const QString& sdsLosslessEncoder)
 {
     int riKeyId;
 
@@ -223,7 +226,19 @@ NvHTTP::startApp(QString verb,
 
     const bool sendHdrMode = (streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) &&
                              sdsChromaMode.isEmpty() &&
-                             !sdsTileRefinement;
+                             !sdsTileRefinement &&
+                             !sdsLosslessMode;
+
+    QString losslessParams;
+    if (sdsLosslessMode) {
+        losslessParams = QStringLiteral("&sdsLosslessMode=1");
+        if (!sdsLosslessHash.isEmpty()) {
+            losslessParams += QStringLiteral("&sdsLosslessHash=") + QString::fromUtf8(QUrl::toPercentEncoding(sdsLosslessHash));
+        }
+        if (!sdsLosslessEncoder.isEmpty()) {
+            losslessParams += QStringLiteral("&sdsLosslessEncoder=") + QString::fromUtf8(QUrl::toPercentEncoding(sdsLosslessEncoder));
+        }
+    }
 
     QString response =
             openConnectionToString(m_BaseUrlHttps,
@@ -242,10 +257,11 @@ NvHTTP::startApp(QString verb,
                                    (sendHdrMode ?
                                        "&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0" :
                                         "")+
-                                   (!sdsChromaMode.isEmpty() ?
+                                   (!sdsChromaMode.isEmpty() && !sdsLosslessMode ?
                                        "&sdsChromaMode=" + QString::fromUtf8(QUrl::toPercentEncoding(sdsChromaMode)) :
                                         "")+
-                                   (sdsTileRefinement ? "&sdsTileRefinement=1" : "")+
+                                   (sdsTileRefinement && !sdsLosslessMode ? "&sdsTileRefinement=1" : "")+
+                                   losslessParams+
                                    "&localAudioPlayMode="+QString::number(localAudio ? 1 : 0)+
                                    "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration))+
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+

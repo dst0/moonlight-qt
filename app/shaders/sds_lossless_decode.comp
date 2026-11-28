@@ -1,0 +1,268 @@
+#version 450
+
+// Bit-exact SDLL v1 Vulkan Compute decode shader (stages: 0=copy_rects, 1=decode_tiles, 2=crc32c_rows)
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer PacketBuf { uint packet_words[]; };
+layout(std430, set = 0, binding = 1) readonly buffer TileDescs { uvec4 descs[]; }; // [x,y,w,h], [mode,off,len,0]
+layout(std430, set = 0, binding = 2) readonly buffer PrevBgra { uint prev_bgra[]; };
+layout(std430, set = 0, binding = 3) buffer CurrBgra { uint curr_bgra[]; };
+layout(std430, set = 0, binding = 4) buffer RowCrcs { uint row_crcs[]; };
+layout(std430, set = 0, binding = 5) readonly buffer CrcTable { uint crc_table[256]; };
+
+layout(push_constant) uniform Params {
+    uint stage;
+    uint width;
+    uint height;
+    uint copy_rect_count;
+    uint dirty_tile_count;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    uvec4 rects[4]; // Packed CopyRects: use rects[i].xy = (src_x|(src_y<<16), dst_x|(dst_y<<16)), .zw = (w|(h<<16), 0)
+} pc;
+
+const int RICE_ESCAPE_Q = 16;
+
+shared uint gs_sy[1024];
+shared uint gs_sco[1024];
+shared uint gs_scg[1024];
+shared int gs_y[1024];
+shared int gs_co[1024];
+shared int gs_cg[1024];
+shared uint gs_ok;
+
+int floor_div2_i(int v) { return (v >= 0) ? (v >> 1) : -((-v + 1) >> 1); }
+
+void rgb8_to_ycocgr_i(uint r, uint g, uint b, out int out_y, out int out_co, out int out_cg) {
+    int ri = int(r), gi = int(g), bi = int(b);
+    out_co = ri - bi;
+    int t = bi + floor_div2_i(out_co);
+    out_cg = gi - t;
+    out_y = t + floor_div2_i(out_cg);
+}
+
+void ycocgr_to_rgb8_i(int y, int co, int cg, out uint out_r, out uint out_g, out uint out_b) {
+    int t = y - floor_div2_i(cg);
+    int g = cg + t;
+    int b = t - floor_div2_i(co);
+    int r = b + co;
+    out_r = uint(r & 0xFF);
+    out_g = uint(g & 0xFF);
+    out_b = uint(b & 0xFF);
+}
+
+int med_predict_i(int a, int b, int c) {
+    int mn = min(a, b), mx = max(a, b);
+    if (c >= mx) return mn;
+    if (c <= mn) return mx;
+    return a + b - c;
+}
+
+int zigzag_decode_i(uint u) {
+    return ((u & 1u) != 0u) ? -int((u >> 1) + 1u) : int(u >> 1);
+}
+
+uint pkt_byte(uint addr) {
+    return (packet_words[addr >> 2] >> ((addr & 3u) * 8u)) & 0xFFu;
+}
+
+bool read_bit_pkt(uint base, uint len, inout uint bit_pos, out uint out_bit) {
+    if (bit_pos >= len * 8u) { out_bit = 0u; return false; }
+    uint b = pkt_byte(base + (bit_pos >> 3));
+    out_bit = (b >> (7u - (bit_pos & 7u))) & 1u;
+    ++bit_pos;
+    return true;
+}
+
+bool read_bits_pkt(uint base, uint len, inout uint bit_pos, int count, out uint out_val) {
+    out_val = 0u;
+    if (count == 0) return true;
+    if (bit_pos + uint(count) > len * 8u) return false;
+    uint v = 0u;
+    for (int i = 0; i < count; ++i) {
+        uint b = pkt_byte(base + (bit_pos >> 3));
+        v = (v << 1) | ((b >> (7u - (bit_pos & 7u))) & 1u);
+        ++bit_pos;
+    }
+    out_val = v;
+    return true;
+}
+
+bool decode_rice_chan(uint base, uint len, uint tw, uint th, int raw_bits, uint ch) {
+    uint bit_pos = 0u;
+    for (uint y = 0u; y < th; ++y) {
+        uint ro = y * tw;
+        uint nz = 0u;
+        if (!read_bit_pkt(base, len, bit_pos, nz)) return false;
+        if (nz == 0u) {
+            for (uint x = 0u; x < tw; ++x) {
+                if (ch == 0u) gs_sy[ro + x] = 0u;
+                else if (ch == 1u) gs_sco[ro + x] = 0u;
+                else gs_scg[ro + x] = 0u;
+            }
+            continue;
+        }
+        uint k = 0u;
+        if (!read_bits_pkt(base, len, bit_pos, 3, k)) return false;
+        for (uint x = 0u; x < tw; ++x) {
+            int q = 0;
+            while (q < RICE_ESCAPE_Q) {
+                uint b = 0u;
+                if (!read_bit_pkt(base, len, bit_pos, b)) return false;
+                if (b != 0u) break;
+                ++q;
+            }
+            uint val = 0u;
+            if (q < RICE_ESCAPE_Q) {
+                uint rem = 0u;
+                if (!read_bits_pkt(base, len, bit_pos, int(k), rem)) return false;
+                val = (uint(q) << k) | rem;
+            } else {
+                if (!read_bits_pkt(base, len, bit_pos, raw_bits, val)) return false;
+            }
+            if (ch == 0u) gs_sy[ro + x] = val;
+            else if (ch == 1u) gs_sco[ro + x] = val;
+            else gs_scg[ro + x] = val;
+        }
+    }
+    return true;
+}
+
+void main() {
+    if (pc.stage == 0u) {
+        uint y = gl_WorkGroupID.x;
+        if (y >= pc.height) return;
+        for (uint x = gl_LocalInvocationID.x; x < pc.width; x += 32u) {
+            uint sx = x, sy = y;
+            for (uint i = 0u; i < pc.copy_rect_count && i < 4u; ++i) {
+                uint rsx = pc.rects[i].x & 0xFFFFu, rsy = pc.rects[i].x >> 16;
+                uint rdx = pc.rects[i].y & 0xFFFFu, rdy = pc.rects[i].y >> 16;
+                uint rw = pc.rects[i].z & 0xFFFFu, rh = pc.rects[i].z >> 16;
+                if (x >= rdx && x < rdx + rw && y >= rdy && y < rdy + rh) {
+                    sx = rsx + (x - rdx);
+                    sy = rsy + (y - rdy);
+                }
+            }
+            curr_bgra[y * pc.width + x] = prev_bgra[sy * pc.width + sx] | 0xFF000000u;
+        }
+        return;
+    }
+
+    if (pc.stage == 2u) {
+        uint y = gl_GlobalInvocationID.x;
+        if (y >= pc.height) return;
+        uint crc = 0xFFFFFFFFu;
+        uint base = y * pc.width;
+        for (uint x = 0u; x < pc.width; ++x) {
+            uint px = curr_bgra[base + x];
+            uint b = px & 0xFFu, g = (px >> 8) & 0xFFu, r = (px >> 16) & 0xFFu;
+            crc = (crc >> 8) ^ crc_table[(crc ^ r) & 0xFFu];
+            crc = (crc >> 8) ^ crc_table[(crc ^ g) & 0xFFu];
+            crc = (crc >> 8) ^ crc_table[(crc ^ b) & 0xFFu];
+        }
+        row_crcs[y] = crc ^ 0xFFFFFFFFu;
+        return;
+    }
+
+    uint tidx = gl_WorkGroupID.x;
+    if (tidx >= pc.dirty_tile_count) return;
+    uvec4 d0 = descs[tidx * 2u];
+    uvec4 d1 = descs[tidx * 2u + 1u];
+    uint tx = d0.x, ty = d0.y, tw = d0.z, th = d0.w;
+    uint mode = d1.x, base = d1.y, plen = d1.z;
+    uint pixels = tw * th;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (mode == 1u) {
+        if (plen != 3u) return;
+        uint px = pkt_byte(base + 2u) | (pkt_byte(base + 1u) << 8) | (pkt_byte(base) << 16) | 0xFF000000u;
+        for (uint i = lid; i < pixels; i += 32u) {
+            curr_bgra[(ty + i / tw) * pc.width + (tx + i % tw)] = px;
+        }
+        return;
+    }
+    if (mode == 5u) {
+        if (plen != pixels * 3u) return;
+        for (uint i = lid; i < pixels; i += 32u) {
+            uint r = pkt_byte(base + i * 3u), g = pkt_byte(base + i * 3u + 1u), b = pkt_byte(base + i * 3u + 2u);
+            curr_bgra[(ty + i / tw) * pc.width + (tx + i % tw)] = b | (g << 8) | (r << 16) | 0xFF000000u;
+        }
+        return;
+    }
+    if (mode == 2u) {
+        if (plen < 1u) return;
+        uint count = pkt_byte(base);
+        if (count < 2u || count > 16u) return;
+        int bpp = (count <= 2u) ? 1 : (count <= 4u ? 2 : 4);
+        uint pal_end = 1u + count * 3u;
+        if (plen < pal_end) return;
+        for (uint i = lid; i < pixels; i += 32u) {
+            uint bi = i * uint(bpp);
+            uint by = pal_end + (bi >> 3);
+            if (by >= plen) break;
+            uint sh = 8u - uint(bpp) - (bi & 7u);
+            uint idx = (pkt_byte(base + by) >> sh) & ((1u << uint(bpp)) - 1u);
+            if (idx >= count) idx = 0u;
+            uint r = pkt_byte(base + 1u + idx * 3u), g = pkt_byte(base + 2u + idx * 3u), b = pkt_byte(base + 3u + idx * 3u);
+            curr_bgra[(ty + i / tw) * pc.width + (tx + i % tw)] = b | (g << 8) | (r << 16) | 0xFF000000u;
+        }
+        return;
+    }
+    if (mode != 3u && mode != 4u) return;
+
+    if (lid == 0u) {
+        gs_ok = 0u;
+        if (plen >= 6u) {
+            uint sy = pkt_byte(base) | (pkt_byte(base + 1u) << 8);
+            uint sco = pkt_byte(base + 2u) | (pkt_byte(base + 3u) << 8);
+            uint scg = pkt_byte(base + 4u) | (pkt_byte(base + 5u) << 8);
+            if (6u + sy + sco + scg <= plen &&
+                decode_rice_chan(base + 6u, sy, tw, th, 8, 0u) &&
+                decode_rice_chan(base + 6u + sy, sco, tw, th, 10, 1u) &&
+                decode_rice_chan(base + 6u + sy + sco, scg, tw, th, 10, 2u)) {
+                gs_ok = 1u;
+            }
+        }
+    }
+    barrier();
+    if (gs_ok == 0u) return;
+
+    if (mode == 3u) {
+        if (lid == 0u) {
+            for (uint y = 0u; y < th; ++y) {
+                for (uint x = 0u; x < tw; ++x) {
+                    uint i = y * tw + x;
+                    int py = med_predict_i((x > 0u) ? gs_y[i - 1u] : 0, (y > 0u) ? gs_y[i - tw] : 0,
+                                           (x > 0u && y > 0u) ? gs_y[i - tw - 1u] : 0);
+                    gs_y[i] = (py + zigzag_decode_i(gs_sy[i])) & 0xFF;
+                    int pco = med_predict_i((x > 0u) ? gs_co[i - 1u] : 0, (y > 0u) ? gs_co[i - tw] : 0,
+                                            (x > 0u && y > 0u) ? gs_co[i - tw - 1u] : 0);
+                    gs_co[i] = pco + zigzag_decode_i(gs_sco[i]);
+                    int pcg = med_predict_i((x > 0u) ? gs_cg[i - 1u] : 0, (y > 0u) ? gs_cg[i - tw] : 0,
+                                            (x > 0u && y > 0u) ? gs_cg[i - tw - 1u] : 0);
+                    gs_cg[i] = pcg + zigzag_decode_i(gs_scg[i]);
+                }
+            }
+        }
+        barrier();
+        for (uint i = lid; i < pixels; i += 32u) {
+            uint r, g, b;
+            ycocgr_to_rgb8_i(gs_y[i], gs_co[i], gs_cg[i], r, g, b);
+            curr_bgra[(ty + i / tw) * pc.width + (tx + i % tw)] = b | (g << 8) | (r << 16) | 0xFF000000u;
+        }
+    } else {
+        for (uint i = lid; i < pixels; i += 32u) {
+            uint addr = (ty + i / tw) * pc.width + (tx + i % tw);
+            uint px = curr_bgra[addr];
+            int py, pco, pcg;
+            rgb8_to_ycocgr_i((px >> 16) & 0xFFu, (px >> 8) & 0xFFu, px & 0xFFu, py, pco, pcg);
+            int yv = (py + zigzag_decode_i(gs_sy[i])) & 0xFF;
+            int cov = pco + zigzag_decode_i(gs_sco[i]);
+            int cgv = pcg + zigzag_decode_i(gs_scg[i]);
+            uint r, g, b;
+            ycocgr_to_rgb8_i(yv, cov, cgv, r, g, b);
+            curr_bgra[addr] = b | (g << 8) | (r << 16) | 0xFF000000u;
+        }
+    }
+}

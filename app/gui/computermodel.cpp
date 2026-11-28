@@ -91,6 +91,10 @@ QVariant ComputerModel::data(const QModelIndex& index, int role) const
         return computer->pairState == NvComputer::PS_PAIRED &&
                !computer->isNvidiaServerSoftware &&
                computer->hasSdsFeature(QStringLiteral("host_encoder"));
+    case SupportsLosslessVideoRole:
+        return computer->pairState == NvComputer::PS_PAIRED &&
+               !computer->isNvidiaServerSoftware &&
+               computer->hasSdsFeature(QStringLiteral("lossless_video"));
     case DetailsRole: {
         QString state, pairState;
 
@@ -168,6 +172,7 @@ QHash<int, QByteArray> ComputerModel::roleNames() const
     names[SupportsAdaptiveTileRefinementRole] = "supportsAdaptiveTileRefinement";
     names[AdaptiveTileRefinementEnabledRole] = "adaptiveTileRefinementEnabled";
     names[SupportsHostEncoderRole] = "supportsHostEncoder";
+    names[SupportsLosslessVideoRole] = "supportsLosslessVideo";
 
     return names;
 }
@@ -232,6 +237,7 @@ QVariantMap ComputerModel::getPcSettings(int computerIndex) const
     bool capabilitiesKnown = false;
     bool supportsAdaptive = false;
     bool supportsHostEncoder = false;
+    bool supportsLosslessVideo = false;
     bool hasHostCaptureAdapter = false;
     {
         QReadLocker lock(&computer->lock);
@@ -244,6 +250,8 @@ QVariantMap ComputerModel::getPcSettings(int computerIndex) const
         supportsAdaptive = paired && computer->hasSdsFeature(QStringLiteral("adaptive_tile_refinement"));
         supportsHostEncoder = paired && !computer->isNvidiaServerSoftware &&
                               computer->hasSdsFeature(QStringLiteral("host_encoder"));
+        supportsLosslessVideo = paired && !computer->isNvidiaServerSoftware &&
+                                computer->hasSdsFeature(QStringLiteral("lossless_video"));
         hasHostCaptureAdapter = paired && !computer->isNvidiaServerSoftware &&
                                 computer->hasSdsFeature(QStringLiteral("host_capture_adapter"));
         for (const NvHostAdapter& adapter : computer->sdsAdapters) {
@@ -266,6 +274,9 @@ QVariantMap ComputerModel::getPcSettings(int computerIndex) const
     result.insert(QStringLiteral("capabilitiesKnown"), capabilitiesKnown);
     result.insert(QStringLiteral("supportsAdaptiveTileRefinement"), supportsAdaptive);
     result.insert(QStringLiteral("adaptiveTileRefinement"), prefs->adaptiveRefinementForHost(fp));
+    result.insert(QStringLiteral("supportsLosslessVideo"), supportsLosslessVideo);
+    result.insert(QStringLiteral("losslessBackends"), computer->sdsLosslessBackends);
+    result.insert(QStringLiteral("losslessModeOverride"), prefs->losslessModeOverrideState(fp));
     result.insert(QStringLiteral("supportsHostEncoder"), supportsHostEncoder);
     result.insert(QStringLiteral("hostEncoderConfig"), static_cast<int>(prefs->hostEncoderForHost(fp)));
     result.insert(QStringLiteral("hasMultipleAdapters"), paired && adapterList.size() > 1);
@@ -332,6 +343,9 @@ bool ComputerModel::setPcSettings(int computerIndex, const QString& expectedFing
     }
     if (settings.contains(QStringLiteral("gameOptimizationsOverride"))) {
         prefs->setGameOptimizationsOverride(fingerprint, settings.value(QStringLiteral("gameOptimizationsOverride")).toInt());
+    }
+    if (settings.contains(QStringLiteral("losslessModeOverride"))) {
+        prefs->setLosslessModeOverride(fingerprint, settings.value(QStringLiteral("losslessModeOverride")).toInt());
     }
     if (settings.contains(QStringLiteral("quitAppAfterOverride"))) {
         prefs->setQuitAppAfterOverride(fingerprint, settings.value(QStringLiteral("quitAppAfterOverride")).toInt());

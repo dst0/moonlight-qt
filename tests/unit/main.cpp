@@ -16,12 +16,14 @@ int main(int argc, char** argv)
     failures += runKeychainTests(argc, argv) != 0;
     failures += runMetalYCoCgRTests(argc, argv) != 0;
     failures += runMetalRefinementTests(argc, argv) != 0;
+    failures += runMetalLosslessTests(argc, argv) != 0;
 #endif
     failures += runNvHttpTests(argc, argv) != 0;
     failures += runBoxArtTests(argc, argv) != 0;
     failures += runPreferencesTests(argc, argv) != 0;
     failures += runPacked444Tests(argc, argv) != 0;
     failures += runAdaptiveRefinementTests(argc, argv) != 0;
+    failures += runLosslessCodecTests(argc, argv) != 0;
 
     qInfo("%s: %d test group(s) failed", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
